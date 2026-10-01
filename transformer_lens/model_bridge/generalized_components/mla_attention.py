@@ -108,6 +108,7 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
 
     # MLA's forward never forks the residual pre-LN; suppress dead HookPoints.
     supports_split_qkv_fork: bool = False
+    _reconstructs_attention = True
 
     def __init__(
         self,
@@ -305,6 +306,9 @@ class MLAAttentionBridge(PositionEmbeddingHooksMixin, AttentionBridge):
         )
 
         # Weighted sum of values
+        attn_weights, value_states = self._apply_attention_relevance_rules(
+            attn_weights, value_states
+        )
         attn_output = torch.matmul(attn_weights, value_states)
 
         # --- Output projection ---

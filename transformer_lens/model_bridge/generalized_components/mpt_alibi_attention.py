@@ -103,6 +103,7 @@ class MPTALiBiAttentionBridge(ALiBiJointQKVAttentionBridge):
             attn_scores, upcast_to_fp32=True, target_dtype=q.dtype
         )
 
+        attn_weights, v = self._apply_attention_relevance_rules(attn_weights, v)
         attn_output = torch.matmul(attn_weights, v)
         attn_output = self._reshape_attn_output(
             attn_output, batch_size, seq_len, num_heads, head_dim

@@ -127,6 +127,7 @@ class ALiBiJointQKVAttentionBridge(JointQKVAttentionBridge):
             attn_scores, upcast_to_fp32=True, target_dtype=q.dtype
         )
 
+        attn_weights, v = self._apply_attention_relevance_rules(attn_weights, v)
         # Weighted sum
         attn_output = torch.matmul(
             attn_weights.view(batch_size * num_heads, seq_len, -1),

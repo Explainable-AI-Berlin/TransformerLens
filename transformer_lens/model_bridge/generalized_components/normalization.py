@@ -8,6 +8,7 @@ import torch
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRuleConflictError,
+    ln_rule,
     ln_rule_grad,
 )
 from transformer_lens.model_bridge.generalized_components.base import (
@@ -39,6 +40,13 @@ RULE_ACTIVE_EDIT_HOOK_CONFLICT = (
     "A forward hook edited hook_scale/hook_normalized while the LN-rule is active on "
     "'{name}': honoring the edit would require the python-norm fallback, which would "
     "compose the rule with the edit and break the bit-identical-forward guarantee."
+)
+# On the python-norm path only hook_scale leaves the backward graph under the rule;
+# hook_normalized sits downstream of the division and keeps receiving gradient.
+RULE_ACTIVE_PYTHON_SCALE_BWD_HOOK_CONFLICT = (
+    "Backward hooks on hook_scale are incompatible with an active LN-rule on '{name}': "
+    "the rule treats the denominator as a constant, so a backward hook on it would "
+    "silently never fire."
 )
 
 
@@ -145,26 +153,22 @@ class NormalizationBridge(GeneralizedComponent):
 
     @property
     def _relevance_rule_kinds(self) -> Tuple[str, ...]:
-        """``("normalization",)`` only when this instance actually dispatches through
-        the native-autograd branch the LN-rule wraps (``_hf_autograd_forward_with_hooks``);
-        empty otherwise, so ``use_relevance_rules`` reports an ln1/ln2 mount that
-        uses the plain python-norm path (for example ``LayerNormPreBridge`` /
-        ``RMSNormPreBridge``, or a config without ``layer_norm_folding``) as
-        skipped rather than silently leaving ordinary gradients in place under a
-        claimed "installed" rule.
+        """Both LN-rule kinds, on either dispatch path.
+
+        The native-autograd branch wraps the component's own forward in the rule's
+        VJP; the python-norm branch divides through the ``ln_rule`` primitive. Which
+        kind applies is decided positionally by the mount name (block norms and
+        ``ln_final`` answer to "normalization", ``attn.q_norm``/``attn.k_norm`` to
+        "qk_normalization"), so a single instance only ever sees one of them.
         """
-        if self.use_native_layernorm_autograd:
-            return ("normalization",)
-        if bool(getattr(self.config, "layer_norm_folding", False)):
-            return ("normalization",)
-        return ()
+        return ("normalization", "qk_normalization")
 
     def _enable_relevance_rule(self, kind: str) -> None:
-        """Activate the LN-rule for this instance's native-forward branch only."""
+        """Activate the LN-rule on whichever dispatch path this instance takes."""
         self._relevance_rule_active = True
 
     def _disable_relevance_rule(self, kind: str) -> None:
-        """Deactivate the LN-rule, restoring today's native-forward behavior."""
+        """Deactivate the LN-rule, restoring the ordinary backward."""
         self._relevance_rule_active = False
 
     @property
@@ -212,6 +216,10 @@ class NormalizationBridge(GeneralizedComponent):
 
     def _python_norm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """From-scratch normalization with live hooks: edits propagate, gradients flow."""
+        if self._relevance_rule_active and self.hook_scale.bwd_hooks:
+            raise RelevanceRuleConflictError(
+                RULE_ACTIVE_PYTHON_SCALE_BWD_HOOK_CONFLICT.format(name=self.name)
+            )
         # Upcast to float32 for normalization precision (matches HT's RMSNorm behavior)
         input_dtype = hidden_states.dtype
         if input_dtype not in (torch.float32, torch.float64):
@@ -223,7 +231,13 @@ class NormalizationBridge(GeneralizedComponent):
                 hidden_states.pow(2).mean(-1, keepdim=True) + getattr(self.config, "eps", 1e-05)
             ).sqrt()
         )
-        hidden_states = self.hook_normalized(hidden_states / scale)
+        # The LN-rule's forward is this same division, so the value is unchanged; only
+        # the backward treats the (possibly hook-edited) scale as a constant.
+        if self._relevance_rule_active:
+            normalized = ln_rule(hidden_states, scale)
+        else:
+            normalized = hidden_states / scale
+        hidden_states = self.hook_normalized(normalized)
         return self._apply_weight_and_bias(hidden_states, input_dtype)
 
     def _apply_weight_and_bias(

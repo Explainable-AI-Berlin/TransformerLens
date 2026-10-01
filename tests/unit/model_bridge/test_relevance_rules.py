@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from transformer_lens.model_bridge import _relevance_rules
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRuleCoverage,
     RelevanceRules,
@@ -146,6 +147,61 @@ class _FakeGatedMLPComponent(nn.Module):
         return x
 
 
+class _FakeAttentionComponent(nn.Module):
+    """A minimal attn-style target: honors both attention kinds, never both at once."""
+
+    _relevance_rule_kinds = ("attention", "attention_half")
+
+    def __init__(self):
+        super().__init__()
+        self._attention_active = False
+        self._half_active = False
+
+    def _enable_relevance_rule(self, kind: str) -> None:
+        if kind == "attention":
+            if self._half_active:
+                raise ValueError("mutually exclusive")
+            self._attention_active = True
+        elif kind == "attention_half":
+            if self._attention_active:
+                raise ValueError("mutually exclusive")
+            self._half_active = True
+
+    def _disable_relevance_rule(self, kind: str) -> None:
+        if kind == "attention":
+            self._attention_active = False
+        elif kind == "attention_half":
+            self._half_active = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class _FakeDelegatingAttention(nn.Module):
+    """Occupies attn but delegates its forward: expected to honor the kinds, cannot."""
+
+    _relevance_rule_kinds: tuple = ()
+    _relevance_rule_unsupported_kinds = ("attention", "attention_half")
+
+    def _enable_relevance_rule(self, kind: str) -> None:
+        raise AssertionError("a delegating attention is never enabled")
+
+    def _disable_relevance_rule(self, kind: str) -> None:
+        raise AssertionError("a delegating attention is never disabled")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class _TinyModel(nn.Module):
+    """A block stack plus the top-level ln_final mount."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([_tiny_block()])
+        self.ln_final = _FakeNormComponent()
+
+
 class _Boom(Exception):
     """Marker exception raised inside a context to test cleanup on failure."""
 
@@ -156,6 +212,8 @@ def test_relevance_rules_defaults_to_no_rules():
     assert rules.activation is False
     assert rules.multiplicative_gate is False
     assert rules.attention is False
+    assert rules.attention_half is False
+    assert rules.qk_normalization is False
 
 
 def test_relevance_rules_is_frozen():
@@ -208,13 +266,96 @@ def test_sandwich_post_norm_on_python_path_is_reported_skipped_never_absent():
         assert set(coverage.skipped) == {"ln2_post"}
 
 
-def test_requesting_a_kind_with_no_canonical_mount_raises():
+def test_requesting_a_kind_with_no_canonical_mount_raises(monkeypatch):
     block = _tiny_block()
-    # "attention" is a valid RelevanceRules field but has no canonical mount, so the
-    # request must raise rather than install nothing and return empty coverage.
+    # Every RelevanceRules field has a canonical mount today; drop one so the guard
+    # against a field with no mount (which would install nothing and return empty
+    # coverage as though the request had succeeded) stays exercised.
+    monkeypatch.delitem(_relevance_rules._CANONICAL_MOUNTS, "attention")
     with pytest.raises(ValueError, match="attention"):
         with use_relevance_rules(block, RelevanceRules(attention=True)):
             pass
+
+
+def test_requesting_both_attention_kinds_raises_before_installing_anything():
+    block = _tiny_block()
+    block.attn = _FakeAttentionComponent()
+    with pytest.raises(ValueError, match="attention_half"):
+        with use_relevance_rules(
+            block, RelevanceRules(normalization=True, attention=True, attention_half=True)
+        ):
+            pass
+    assert block.ln1._rule_active is False
+    assert block.attn._attention_active is False
+    assert block.attn._half_active is False
+
+
+@pytest.mark.parametrize("kind", ["attention", "attention_half"])
+def test_attention_kinds_install_on_the_attn_mount(kind):
+    block = _tiny_block()
+    block.attn = _FakeAttentionComponent()
+    with use_relevance_rules(block, RelevanceRules(**{kind: True})) as coverage:
+        assert coverage.installed == ("attn",)
+        assert coverage.skipped == ()
+        assert block.attn._attention_active is (kind == "attention")
+        assert block.attn._half_active is (kind == "attention_half")
+    assert block.attn._attention_active is False
+    assert block.attn._half_active is False
+
+
+@pytest.mark.parametrize("kind", ["attention", "attention_half"])
+def test_delegating_attention_at_the_attn_mount_raises(kind):
+    """A delegating attention forward cannot honor either attention kind and names
+    them unsupported, so the request raises instead of being silently skipped."""
+    block = _tiny_block()
+    block.attn = _FakeDelegatingAttention()
+    with pytest.raises(RelevanceRuleUnsupportedError, match="attn"):
+        with use_relevance_rules(block, RelevanceRules(**{kind: True})):
+            pass
+
+
+def test_refusal_to_enable_releases_the_scope_s_earlier_acquisitions():
+    """A component that raises from _enable_relevance_rule (the attention bridge does
+    when an outer scope holds the other, mutually exclusive kind) must not leave the
+    failed scope's earlier acquisitions behind, nor disturb the outer scope."""
+    block = _tiny_block()
+    block.attn = _FakeAttentionComponent()
+    with use_relevance_rules(block, RelevanceRules(attention=True)):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            with use_relevance_rules(
+                block, RelevanceRules(normalization=True, attention_half=True)
+            ):
+                pass
+        assert block.ln1._rule_active is False
+        assert block.ln2._rule_active is False
+        assert block.attn._attention_active is True
+        assert block.attn._half_active is False
+    assert block.attn._attention_active is False
+
+
+def test_normalization_rule_installs_on_the_ln_final_mount():
+    model = _TinyModel()
+    with use_relevance_rules(model, RelevanceRules(normalization=True)) as coverage:
+        assert set(coverage.installed) == {"blocks.0.ln1", "blocks.0.ln2", "ln_final"}
+        assert model.ln_final._rule_active is True
+    assert model.ln_final._rule_active is False
+
+
+def test_qk_normalization_targets_q_norm_and_k_norm_and_nothing_else():
+    block = _tiny_block()
+    block.q_norm._relevance_rule_kinds = ("normalization", "qk_normalization")
+    block.k_norm = _FakeNormComponent()
+    block.k_norm._relevance_rule_kinds = ("normalization", "qk_normalization")
+    with use_relevance_rules(block, RelevanceRules(qk_normalization=True)) as coverage:
+        assert set(coverage.installed) == {"q_norm", "k_norm"}
+        assert coverage.skipped == ()
+        assert block.ln1._rule_active is False
+        assert block.ln2._rule_active is False
+    assert block.q_norm._rule_active is False
+    with use_relevance_rules(block, RelevanceRules(normalization=True)) as coverage:
+        assert set(coverage.installed) == {"ln1", "ln2"}
+        assert block.q_norm._rule_active is False
+        assert block.k_norm._rule_active is False
 
 
 def test_unsupported_component_at_targeted_mount_is_skipped():

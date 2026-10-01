@@ -30,6 +30,7 @@ class JointQKVAttentionBridge(AttentionBridge):
     """
 
     supports_attn_result: bool = True
+    _reconstructs_attention = True
 
     # property_aliases inherited from AttentionBridge (W_Q, W_K, W_V, W_O, b_Q, b_K, b_V, b_O)
 
@@ -544,6 +545,7 @@ class JointQKVAttentionBridge(AttentionBridge):
             attn_scores,
             target_dtype=v.dtype if reorder_and_upcast else None,
         )
+        attn_weights, v = self._apply_attention_relevance_rules(attn_weights, v)
         attn_output = torch.matmul(attn_weights, v)
         attn_output = self._reshape_attn_output(
             attn_output, batch_size, seq_len, num_heads, head_dim

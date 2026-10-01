@@ -354,6 +354,7 @@ class CodeGenAttentionBridge(JointQKVAttentionBridge):
             target_dtype=v.dtype,
         )
 
+        attn_weights, v = self._apply_attention_relevance_rules(attn_weights, v)
         attn_output = torch.matmul(attn_weights, v)
 
         # Reshape [batch, heads, seq, head_dim] → [batch, seq, hidden]

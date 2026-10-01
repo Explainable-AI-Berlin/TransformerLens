@@ -3,7 +3,7 @@
 This module contains the bridge component for attention layers.
 """
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import einops
 import torch
@@ -18,6 +18,7 @@ from transformer_lens.conversion_utils.conversion_steps.base_tensor_conversion i
     BaseTensorConversion,
 )
 from transformer_lens.hook_points import HookPoint
+from transformer_lens.model_bridge._relevance_rules import scale_gradient
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
 )
@@ -53,6 +54,11 @@ class AttentionBridge(GeneralizedComponent):
     supports_split_qkv_fork: bool = True
     # Reconstructed variants can opt in independently of Q/K/V input forks.
     supports_attn_result: bool = False
+    # True only on a forward that applies hook_pattern before its own pattern @ V
+    # product, where _apply_attention_relevance_rules can reach both factors. A
+    # forward that delegates to the wrapped module must leave this False: there the
+    # rule would have nothing to attach to and would silently never apply.
+    _reconstructs_attention: ClassVar[bool] = False
     property_aliases = {
         "W_Q": "q.weight",
         "W_K": "k.weight",
@@ -140,6 +146,8 @@ class AttentionBridge(GeneralizedComponent):
             self.hook_v_input = HookPoint()
         self._captured_pre_ln_residual: Optional[torch.Tensor] = None
         self._ln1_module: Optional[torch.nn.Module] = None
+        self._relevance_rule_attention_active = False
+        self._relevance_rule_attention_half_active = False
         if (
             hasattr(config, "positional_embedding_type")
             and config.positional_embedding_type == "rotary"
@@ -500,6 +508,71 @@ class AttentionBridge(GeneralizedComponent):
         if hasattr(self, "o") and self.o is not None:
             attn_output = self.o(attn_output)
         return attn_output
+
+    @property
+    def _relevance_rule_kinds(self) -> Tuple[str, ...]:
+        """Both attention kinds when this bridge reconstructs attention in Python."""
+        if self._reconstructs_attention:
+            return ("attention", "attention_half")
+        return ()
+
+    @property
+    def _relevance_rule_unsupported_kinds(self) -> Tuple[str, ...]:
+        """Both attention kinds on a delegating forward.
+
+        An attention mount is expected to honor the attention rules, but a forward
+        that hands the computation to the wrapped module fires ``hook_pattern`` only
+        on the returned weights, after the output exists, so a rule there would be a
+        silent no-op. Naming the kinds here makes ``use_relevance_rules`` raise
+        instead of reporting the mount skipped.
+        """
+        if self._reconstructs_attention:
+            return ()
+        return ("attention", "attention_half")
+
+    def _enable_relevance_rule(self, kind: str) -> None:
+        """Activate one attention rule; the two kinds rewrite the same edge, never both."""
+        if kind == "attention":
+            if self._relevance_rule_attention_half_active:
+                raise ValueError(
+                    f"Cannot enable the 'attention' rule on {self.name!r} while "
+                    "'attention_half' is active: the two kinds are mutually exclusive."
+                )
+            self._relevance_rule_attention_active = True
+        elif kind == "attention_half":
+            if self._relevance_rule_attention_active:
+                raise ValueError(
+                    f"Cannot enable the 'attention_half' rule on {self.name!r} while "
+                    "'attention' is active: the two kinds are mutually exclusive."
+                )
+            self._relevance_rule_attention_half_active = True
+
+    def _disable_relevance_rule(self, kind: str) -> None:
+        """Deactivate one attention rule, restoring the ordinary backward."""
+        if kind == "attention":
+            self._relevance_rule_attention_active = False
+        elif kind == "attention_half":
+            self._relevance_rule_attention_half_active = False
+
+    def _apply_attention_relevance_rules(
+        self, pattern: torch.Tensor, values: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rewrite the backward of the ``pattern @ values`` product under an active rule.
+
+        Called by every reconstructing forward on the two factors immediately before
+        their product -- the only point where both are in scope. Forward values are
+        returned unchanged. Under the AH-rule the pattern is detached: it is a
+        constant in the backward pass, so no relevance flows into the softmax, the
+        scores or the query/key path (the same contract as ``ln_rule`` treating its
+        denominator as constant). Under the Half-rule the gradient reaching each
+        factor is halved, splitting the product's relevance evenly between the
+        pattern and the values.
+        """
+        if self._relevance_rule_attention_active:
+            return pattern.detach(), values
+        if self._relevance_rule_attention_half_active:
+            return scale_gradient(pattern, 0.5), scale_gradient(values, 0.5)
+        return pattern, values
 
     def _softmax_dropout_pattern(
         self,

@@ -223,6 +223,9 @@ class GlmMoeDsaAttentionBridge(MLAAttentionBridge):
         if self.training and hf_attn.attention_dropout:
             attn_weights = F.dropout(attn_weights, p=hf_attn.attention_dropout, training=True)
 
+        attn_weights, value_states = self._apply_attention_relevance_rules(
+            attn_weights, value_states
+        )
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_length, -1)

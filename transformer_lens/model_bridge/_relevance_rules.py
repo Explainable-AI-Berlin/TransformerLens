@@ -163,12 +163,29 @@ class RelevanceRules:
     Each field names a rule kind. Setting it ``True`` requests that rule wherever a
     component at that kind's canonical mount point implements ``_RelevanceRuleCapable``.
     Unset fields (the default) leave the corresponding components untouched.
+
+    ``normalization``: LN-rule (denominator treated as a constant) on the block norms
+    ``ln1``/``ln2``, the sandwich post-norms ``ln1_post``/``ln2_post`` and ``ln_final``.
+    ``qk_normalization``: the same LN-rule on the attention query/key norms
+    ``attn.q_norm``/``attn.k_norm``, requested separately so block-level and per-head
+    norms can be studied independently.
+    ``activation``: Identity-rule on a gated MLP's activation function.
+    ``multiplicative_gate``: Half-rule on a gated MLP's ``act(gate) * up`` product.
+    ``attention``: AH-rule -- the post-softmax pattern is a constant in the backward
+    pass, so relevance reaches the residual stream only through the value path. Since
+    no gradient enters the pattern, backward hooks on ``hook_pattern`` and
+    ``hook_attn_scores`` never fire and the query/key weights receive no gradient.
+    ``attention_half``: Half-rule on the ``pattern @ V`` product -- the gradient
+    reaching the pattern and the gradient reaching the values are each halved.
+    ``attention`` and ``attention_half`` are mutually exclusive.
     """
 
     normalization: bool = False
     activation: bool = False
     multiplicative_gate: bool = False
     attention: bool = False
+    attention_half: bool = False
+    qk_normalization: bool = False
 
 
 @dataclasses.dataclass
@@ -217,16 +234,25 @@ class _RelevanceRuleCapable(Protocol):
 
 # Canonical mount name per rule kind. Targeting is positional: a component is only
 # considered for a kind when it sits at that kind's mount name, never by isinstance,
-# so a same-class component mounted elsewhere (for example a q_norm sharing
-# NormalizationBridge's class) is left untouched. The normalization kind lists both
-# the pre-norm mounts (ln1, ln2) and the sandwich post-norm mounts (ln1_post,
-# ln2_post) so the LN-rule reaches the post-attention/post-MLP norms that
-# sandwich-norm architectures mount there, matching the pinned RelP reference.
+# so a same-class component mounted elsewhere is left untouched -- a q_norm sharing
+# NormalizationBridge's class is reached only through "qk_normalization", never
+# through "normalization". The normalization kind lists the pre-norm mounts (ln1,
+# ln2), the sandwich post-norm mounts (ln1_post, ln2_post) that sandwich-norm
+# architectures mount there, and the final norm, matching the pinned RelP reference.
+# Both attention kinds target the block attention mount; the component decides
+# which of them it can honor.
 _CANONICAL_MOUNTS: Mapping[str, Tuple[str, ...]] = {
-    "normalization": ("ln1", "ln2", "ln1_post", "ln2_post"),
+    "normalization": ("ln1", "ln2", "ln1_post", "ln2_post", "ln_final"),
+    "qk_normalization": ("q_norm", "k_norm"),
     "activation": ("mlp",),
     "multiplicative_gate": ("mlp",),
+    "attention": ("attn",),
+    "attention_half": ("attn",),
 }
+
+# Kind groups that cannot be requested together in one scope: each group's rules
+# rewrite the same backward edge, so honoring both would stack one on the other.
+_MUTUALLY_EXCLUSIVE_KINDS: Tuple[Tuple[str, ...], ...] = (("attention", "attention_half"),)
 
 
 def _iter_canonical_mount_candidates(
@@ -298,10 +324,12 @@ def use_relevance_rules(model: nn.Module, rules: RelevanceRules) -> Iterator[Rel
     instead: that names a kind the component is expected to honor at this mount but
     cannot given its current configuration, so silently skipping it would let
     analysis proceed as if the caller had never asked. Requesting a kind that has no
-    canonical mount at all (for example "attention", a valid ``RelevanceRules`` field
-    with no mount defined) raises ``ValueError`` before the install loop, since there
+    canonical mount at all raises ``ValueError`` before the install loop, since there
     is no mount to target and the scope would otherwise return empty coverage as
-    though the request had succeeded. Scopes over the same model
+    though the request had succeeded; so does requesting two mutually exclusive kinds
+    (``attention`` and ``attention_half``). A model that mixes capable and delegating
+    attention mounts (a language model with a vision tower, say) can be scoped to its
+    capable subtree: ``use_relevance_rules(bridge.blocks, rules)``. Scopes over the same model
     are reference-counted, so an inner scope's exit never disables a rule an outer
     scope still needs. No model configuration is mutated; the only state that
     changes lives on the participating components, and only for the scope's
@@ -310,6 +338,15 @@ def use_relevance_rules(model: nn.Module, rules: RelevanceRules) -> Iterator[Rel
     requested_kinds = [
         field.name for field in dataclasses.fields(rules) if getattr(rules, field.name)
     ]
+
+    for group in _MUTUALLY_EXCLUSIVE_KINDS:
+        clashing = [kind for kind in group if kind in requested_kinds]
+        if len(clashing) > 1:
+            joined = " and ".join(repr(kind) for kind in clashing)
+            raise ValueError(
+                f"Relevance-rule kinds {joined} are mutually exclusive: they rewrite the "
+                "same backward edge, so request at most one of them per scope."
+            )
 
     unmapped_kinds = [kind for kind in requested_kinds if kind not in _CANONICAL_MOUNTS]
     if unmapped_kinds:
@@ -332,17 +369,24 @@ def use_relevance_rules(model: nn.Module, rules: RelevanceRules) -> Iterator[Rel
             if isinstance(module, _RelevanceRuleCapable) and kind in unsupported_kinds:
                 raise RelevanceRuleUnsupportedError(
                     f"{name!r} ({type(module).__name__}) cannot install the {kind!r} "
-                    "relevance rule: unsupported configuration for this component."
+                    "relevance rule: unsupported configuration for this component. To "
+                    "leave it out, scope the request to a capable subtree, for example "
+                    "use_relevance_rules(bridge.blocks, rules)."
                 )
             skipped.append(name)
 
-    for _, module, kind in installed:
-        _acquire_rule(module, kind)
+    # Track acquisitions one by one so a component that refuses to enable (for
+    # example an attention mount whose other, mutually exclusive kind an outer
+    # scope holds) leaves no earlier acquisition of this scope behind.
+    acquired: List[Tuple[_RelevanceRuleCapable, str]] = []
     try:
+        for _, module, kind in installed:
+            _acquire_rule(module, kind)
+            acquired.append((module, kind))
         yield RelevanceRuleCoverage(
             installed=tuple(name for name, _, _ in installed),
             skipped=tuple(skipped),
         )
     finally:
-        for _, module, kind in installed:
+        for module, kind in acquired:
             _release_rule(module, kind)

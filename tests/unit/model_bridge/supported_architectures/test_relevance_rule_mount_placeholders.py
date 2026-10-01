@@ -29,11 +29,17 @@ from transformer_lens.model_bridge.generalized_components import NormalizationBr
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
 )
+from transformer_lens.model_bridge.generalized_components.rms_normalization import (
+    RMSNormalizationBridge,
+)
 from transformer_lens.model_bridge.supported_architectures.gemma3n import (
     Gemma3nArchitectureAdapter,
 )
 from transformer_lens.model_bridge.supported_architectures.gemma4 import (
     Gemma4ArchitectureAdapter,
+)
+from transformer_lens.model_bridge.supported_architectures.qwen3 import (
+    Qwen3ArchitectureAdapter,
 )
 from transformer_lens.model_bridge.supported_architectures.stablelm import (
     StableLmArchitectureAdapter,
@@ -97,6 +103,24 @@ class TestGemma4Placeholders:
             assert not isinstance(component, _RelevanceRuleCapable)
 
 
+class TestQwen3QkNormMounts:
+    """Qwen3 mounts genuine RMSNormalizationBridge q/k norms under attn: the positive
+    case for the "qk_normalization" kind, which targets exactly these mount keys."""
+
+    def _adapter(self) -> Qwen3ArchitectureAdapter:
+        cfg = make_bridge_cfg("Qwen3ForCausalLM", n_key_value_heads=2, d_head=8)
+        return Qwen3ArchitectureAdapter(cfg)
+
+    def test_q_norm_and_k_norm_are_rule_capable_under_qk_normalization(self):
+        block_submodules = _block_submodules(self._adapter())
+        attn_submodules = _attn_submodules(block_submodules, "attn")
+        for key in ("q_norm", "k_norm"):
+            component = attn_submodules[key]
+            assert isinstance(component, RMSNormalizationBridge)
+            assert isinstance(component, _RelevanceRuleCapable)
+            assert "qk_normalization" in component._relevance_rule_kinds
+
+
 class TestStableLmPlaceholders:
     def _adapter(self) -> StableLmArchitectureAdapter:
         cfg = make_bridge_cfg("StableLmForCausalLM", n_key_value_heads=2, d_head=8)
@@ -110,13 +134,15 @@ class TestStableLmPlaceholders:
             component = block_submodules[key]
             assert isinstance(component, NormalizationBridge)
             assert isinstance(component, _RelevanceRuleCapable)
-            assert component._relevance_rule_kinds == ("normalization",)
+            assert component._relevance_rule_kinds == ("normalization", "qk_normalization")
 
     def test_per_head_norms_are_keyed_q_norm_k_norm_not_ln1_ln2(self):
         """The wrapped HF module is named q_layernorm/k_layernorm, but the mount
         KEY the canonical-mount check reads is q_norm/k_norm -- distinct either
         way from ln1/ln2, so these stay invisible to the "normalization" rule
-        regardless of which naming convention the underlying HF module uses."""
+        regardless of which naming convention the underlying HF module uses.
+        Being plain placeholders without the protocol, a "qk_normalization"
+        request reports them skipped rather than raising."""
         block_submodules = _block_submodules(self._adapter())
         attn_submodules = _attn_submodules(block_submodules, "attn")
         assert attn_submodules["q_norm"].name == "q_layernorm"

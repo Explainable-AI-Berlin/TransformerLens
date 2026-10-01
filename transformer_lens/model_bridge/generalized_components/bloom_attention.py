@@ -199,6 +199,7 @@ class BloomAttentionBridge(JointQKVAttentionBridge):
 
         # bmm in [batch*heads, seq, seq] format for BLOOM compatibility
         attn_weights_bh = attn_weights.reshape(batch_size * num_heads, seq_len, -1)
+        attn_weights_bh, v_bh = self._apply_attention_relevance_rules(attn_weights_bh, v_bh)
         attn_output = torch.bmm(attn_weights_bh, v_bh)
 
         attn_output = attn_output.view(batch_size, num_heads, seq_len, head_dim)

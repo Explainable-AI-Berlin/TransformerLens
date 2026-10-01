@@ -41,6 +41,7 @@ class _LLaDAAttentionBridge(AttentionBridge):
 
     supports_split_qkv_fork: bool = False
     supports_attn_result: bool = True
+    _reconstructs_attention = True
 
     def set_original_component(self, original_component: torch.nn.Module) -> None:
         """Patch the owning block without registering it as a child module."""
@@ -130,6 +131,7 @@ class _LLaDAAttentionBridge(AttentionBridge):
             pattern = torch.nn.functional.dropout(pattern, p=dropout, training=True)
         pattern = self.hook_pattern(pattern)
 
+        pattern, v = self._apply_attention_relevance_rules(pattern, v)
         z = torch.matmul(pattern, v).transpose(1, 2).contiguous()
         flat_z = z.view(batch_size, query_len, n_heads * head_dim)
         if bool(getattr(self.config, "use_attn_result", False)):

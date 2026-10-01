@@ -62,6 +62,7 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
     """
 
     supports_attn_result: bool = True
+    _reconstructs_attention = True
 
     # NoPE architectures (EXAONE-4, SmolLM3, Cohere2) deliberately null
     # position_embeddings on their non-rotary layers to match HF. Their bridge
@@ -537,6 +538,9 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         attn_weights = self.hook_pattern(attn_weights)
 
         # --- Attention Output ---
+        attn_weights, value_states_expanded = self._apply_attention_relevance_rules(
+            attn_weights, value_states_expanded
+        )
         attn_output = torch.matmul(attn_weights, value_states_expanded)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1)
