@@ -8,6 +8,7 @@ import torch
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRuleConflictError,
+    ln_rule,
     ln_rule_grad,
 )
 from transformer_lens.model_bridge.generalized_components.base import (
@@ -143,28 +144,18 @@ class NormalizationBridge(GeneralizedComponent):
         self._uses_rms_norm_override = uses_rms_norm
         self._relevance_rule_active = False
 
-    @property
-    def _relevance_rule_kinds(self) -> Tuple[str, ...]:
-        """``("normalization",)`` only when this instance actually dispatches through
-        the native-autograd branch the LN-rule wraps (``_hf_autograd_forward_with_hooks``);
-        empty otherwise, so ``use_relevance_rules`` reports an ln1/ln2 mount that
-        uses the plain python-norm path (for example ``LayerNormPreBridge`` /
-        ``RMSNormPreBridge``, or a config without ``layer_norm_folding``) as
-        skipped rather than silently leaving ordinary gradients in place under a
-        claimed "installed" rule.
-        """
-        if self.use_native_layernorm_autograd:
-            return ("normalization",)
-        if bool(getattr(self.config, "layer_norm_folding", False)):
-            return ("normalization",)
-        return ()
+    # The LN-rule applies on both dispatch paths: the native-autograd path wraps the
+    # component's own forward in the rule's VJP, the python-norm path divides through
+    # ``ln_rule``. Which kind reaches an instance is decided by its mount name (block
+    # norms and ln_final: "normalization"; attn.q_norm/attn.k_norm: "qk_normalization").
+    _relevance_rule_kinds: Tuple[str, ...] = ("normalization", "qk_normalization")
 
     def _enable_relevance_rule(self, kind: str) -> None:
-        """Activate the LN-rule for this instance's native-forward branch only."""
+        """Activate the LN-rule on whichever dispatch path this instance takes."""
         self._relevance_rule_active = True
 
     def _disable_relevance_rule(self, kind: str) -> None:
-        """Deactivate the LN-rule, restoring today's native-forward behavior."""
+        """Deactivate the LN-rule, restoring the ordinary backward."""
         self._relevance_rule_active = False
 
     @property
@@ -223,7 +214,12 @@ class NormalizationBridge(GeneralizedComponent):
                 hidden_states.pow(2).mean(-1, keepdim=True) + getattr(self.config, "eps", 1e-05)
             ).sqrt()
         )
-        hidden_states = self.hook_normalized(hidden_states / scale)
+        # ln_rule's forward is this same division; its backward holds the (possibly
+        # hook-edited) scale constant.
+        normalized = (
+            ln_rule(hidden_states, scale) if self._relevance_rule_active else hidden_states / scale
+        )
+        hidden_states = self.hook_normalized(normalized)
         return self._apply_weight_and_bias(hidden_states, input_dtype)
 
     def _apply_weight_and_bias(

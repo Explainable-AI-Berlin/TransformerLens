@@ -6,7 +6,9 @@ The fixture component below installs the real LN-rule primitive
 these tests focused on the scoping mechanics -- forward identity, gradient restoration,
 nested contexts, exception safety, and positional (not class-based) targeting -- rather
 than on any concrete NormalizationBridge or gated-MLP integration, which land in later
-commits.
+commits. ``_FakeAttention`` covers the same mechanics for the hook rules the attention
+kinds use, plus their mutual exclusion and their check that the rewritten HookPoints
+feed the output.
 
 The scoped context does not exist yet, so this fails collection with a single
 ImportError -- the expected red state before the context is implemented.
@@ -18,6 +20,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from transformer_lens.hook_points import HookPoint
+from transformer_lens.model_bridge import _relevance_rules
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRuleCoverage,
     RelevanceRules,
@@ -156,6 +160,8 @@ def test_relevance_rules_defaults_to_no_rules():
     assert rules.activation is False
     assert rules.multiplicative_gate is False
     assert rules.attention is False
+    assert rules.attention_half is False
+    assert rules.qk_normalization is False
 
 
 def test_relevance_rules_is_frozen():
@@ -208,10 +214,11 @@ def test_sandwich_post_norm_on_python_path_is_reported_skipped_never_absent():
         assert set(coverage.skipped) == {"ln2_post"}
 
 
-def test_requesting_a_kind_with_no_canonical_mount_raises():
+def test_requesting_a_kind_with_no_canonical_mount_raises(monkeypatch):
     block = _tiny_block()
-    # "attention" is a valid RelevanceRules field but has no canonical mount, so the
-    # request must raise rather than install nothing and return empty coverage.
+    # A RelevanceRules field without a canonical mount must raise rather than install
+    # nothing and return empty coverage.
+    monkeypatch.delitem(_relevance_rules._CANONICAL_MOUNTS, "attention")
     with pytest.raises(ValueError, match="attention"):
         with use_relevance_rules(block, RelevanceRules(attention=True)):
             pass
@@ -367,3 +374,200 @@ def test_nested_scopes_over_different_kinds_on_one_mount_refcount_independently(
         assert block.mlp._activation_rule_active is True
         assert block.mlp._gate_rule_active is False
     assert block.mlp._activation_rule_active is False
+
+
+class _FakeAttention(nn.Module):
+    """An attn-mount target exposing the HookPoints the attention hook rules rewrite.
+
+    Like a reconstructing attention bridge, it runs ``hook_pattern`` and ``hook_v`` on
+    the two factors of its ``pattern @ v`` product. With ``delegating=True`` it instead
+    fires ``hook_pattern`` only after its output exists, like a bridge that hands the
+    computation to the wrapped module and hooks the attention weights it returns.
+    """
+
+    def __init__(self, delegating: bool = False, with_value_hook: bool = True):
+        super().__init__()
+        self.delegating = delegating
+        self.hook_pattern = HookPoint()
+        if with_value_hook:
+            self.hook_v = HookPoint()
+        self.hook_out = HookPoint()
+
+    def forward(self, scores: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if self.delegating:
+            output = self.hook_out(scores.softmax(-1) @ v)
+            self.hook_pattern(scores.softmax(-1))
+            return output
+        pattern = self.hook_pattern(scores.softmax(-1))
+        if "hook_v" in self._modules:
+            v = self.hook_v(v)
+        return self.hook_out(pattern @ v)
+
+
+class _AttentionBlock(nn.Module):
+    def __init__(self, attn: nn.Module):
+        super().__init__()
+        self.attn = attn
+
+    def forward(self, scores: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self.attn(scores, v)
+
+
+def _attention_inputs() -> tuple:
+    generator = torch.Generator().manual_seed(0)
+    scores = torch.randn(2, 3, 3, generator=generator, requires_grad=True)
+    v = torch.randn(2, 3, 4, generator=generator, requires_grad=True)
+    grad_output = torch.randn(2, 3, 4, generator=generator)
+    return scores, v, grad_output
+
+
+def _attention_grads(block: nn.Module) -> tuple:
+    """Output plus the gradients reaching the scores and the values (None if unreached)."""
+    scores, v, grad_output = _attention_inputs()
+    output = block(scores, v)
+    grads = torch.autograd.grad(output, (scores, v), grad_outputs=grad_output, allow_unused=True)
+    return output.detach(), grads
+
+
+def _rule_hook_count(attn: nn.Module) -> int:
+    return sum(len(module._forward_hooks) for module in attn.modules())
+
+
+def test_attention_rule_holds_the_pattern_constant_and_keeps_the_value_path():
+    block = _AttentionBlock(_FakeAttention())
+    plain_output, (_, plain_grad_v) = _attention_grads(block)
+    with use_relevance_rules(block, RelevanceRules(attention=True)) as coverage:
+        assert coverage.installed == ("attn",)
+        output, (grad_scores, grad_v) = _attention_grads(block)
+    assert torch.equal(output, plain_output)
+    assert grad_scores is None
+    assert torch.equal(grad_v, plain_grad_v)
+
+
+def test_attention_half_rule_halves_the_gradient_reaching_each_factor():
+    block = _AttentionBlock(_FakeAttention())
+    plain_output, (plain_grad_scores, plain_grad_v) = _attention_grads(block)
+    with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+        output, (grad_scores, grad_v) = _attention_grads(block)
+    assert torch.equal(output, plain_output)
+    assert torch.equal(grad_scores, 0.5 * plain_grad_scores)
+    assert torch.equal(grad_v, 0.5 * plain_grad_v)
+
+
+def test_hook_rule_leaves_no_hooks_behind_and_restores_ordinary_gradients():
+    block = _AttentionBlock(_FakeAttention())
+    _, plain_grads = _attention_grads(block)
+    with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+        assert _rule_hook_count(block.attn) > 0
+    assert _rule_hook_count(block.attn) == 0
+    _, grads = _attention_grads(block)
+    for grad, plain_grad in zip(grads, plain_grads):
+        assert torch.equal(grad, plain_grad)
+
+
+def test_nested_requests_of_a_hook_rule_do_not_stack():
+    block = _AttentionBlock(_FakeAttention())
+    _, (plain_grad_scores, _) = _attention_grads(block)
+    with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+        with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+            _, (grad_scores, _) = _attention_grads(block)
+        # Halved once, not quartered; and the inner exit keeps the outer rule.
+        assert torch.equal(grad_scores, 0.5 * plain_grad_scores)
+        _, (grad_scores, _) = _attention_grads(block)
+        assert torch.equal(grad_scores, 0.5 * plain_grad_scores)
+    assert _rule_hook_count(block.attn) == 0
+
+
+def test_mutually_exclusive_kinds_in_one_scope_raise_and_leave_no_state():
+    block = _AttentionBlock(_FakeAttention())
+    with pytest.raises(ValueError, match="attention_half"):
+        with use_relevance_rules(block, RelevanceRules(attention=True, attention_half=True)):
+            pass
+    assert _rule_hook_count(block.attn) == 0
+    assert not any(block.attn._relevance_rule_refcounts.values())
+
+
+def test_mutually_exclusive_kind_is_refused_inside_an_outer_scope():
+    block = _AttentionBlock(_FakeAttention())
+    _, (plain_grad_scores, _) = _attention_grads(block)
+    with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+        with pytest.raises(ValueError, match="'attention_half' is active"):
+            with use_relevance_rules(block, RelevanceRules(attention=True)):
+                pass
+        _, (grad_scores, _) = _attention_grads(block)
+        assert torch.equal(grad_scores, 0.5 * plain_grad_scores)
+    assert _rule_hook_count(block.attn) == 0
+
+
+def test_hook_rule_on_a_forward_that_hooks_the_pattern_after_its_output_raises():
+    block = _AttentionBlock(_FakeAttention(delegating=True))
+    scores, v, _ = _attention_inputs()
+    with use_relevance_rules(block, RelevanceRules(attention=True)) as coverage:
+        assert coverage.installed == ("attn",)
+        with pytest.raises(RelevanceRuleUnsupportedError, match="hook_pattern"):
+            block(scores, v)
+    assert _rule_hook_count(block.attn) == 0
+
+
+def test_hook_rule_needing_a_hook_point_the_mount_lacks_raises_at_entry():
+    block = _AttentionBlock(_FakeAttention(with_value_hook=False))
+    with pytest.raises(RelevanceRuleUnsupportedError, match="attn"):
+        with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+            pass
+    # The AH-rule rewrites only hook_pattern, which this mount does expose.
+    with use_relevance_rules(block, RelevanceRules(attention=True)) as coverage:
+        assert coverage.installed == ("attn",)
+
+
+def test_attn_mount_without_attention_hook_points_is_skipped():
+    block = _AttentionBlock(_PlainMount())
+    with use_relevance_rules(block, RelevanceRules(attention=True)) as coverage:
+        assert coverage.installed == ()
+        assert coverage.skipped == ("attn",)
+
+
+def test_hook_rule_survives_user_hook_removal_and_composes_with_user_edits():
+    block = _AttentionBlock(_FakeAttention())
+    hook_pattern = block.attn.hook_pattern
+    hook_pattern.add_hook(lambda pattern, hook: pattern * 0.5)
+    try:
+        edited_output, _ = _attention_grads(block)
+        with use_relevance_rules(block, RelevanceRules(attention=True)):
+            # Clearing every user hook, permanent ones included, keeps the rule.
+            hook_pattern.remove_hooks(including_permanent=True)
+            hook_pattern.add_hook(lambda pattern, hook: pattern * 0.5)
+            output, (grad_scores, _) = _attention_grads(block)
+        assert torch.equal(output, edited_output)
+        assert grad_scores is None
+    finally:
+        hook_pattern.remove_hooks(including_permanent=True)
+
+
+def test_backward_hooks_on_the_factors_see_the_half_rule_gradient():
+    """The gradient is scaled before the HookPoint's own backward hooks run, so they
+    observe the rule's gradient, and one that returns a gradient keeps the rule."""
+    block = _AttentionBlock(_FakeAttention())
+    _, (plain_grad_scores, _) = _attention_grads(block)
+    seen = []
+    block.attn.hook_v.add_hook(lambda grad, hook: seen.append(grad), dir="bwd")
+    block.attn.hook_pattern.add_hook(lambda grad, hook: grad, dir="bwd")
+    try:
+        _attention_grads(block)
+        plain_seen = seen.pop()
+        with use_relevance_rules(block, RelevanceRules(attention_half=True)):
+            _, (grad_scores, _) = _attention_grads(block)
+    finally:
+        block.attn.hook_v.remove_hooks(dir="both")
+        block.attn.hook_pattern.remove_hooks(dir="both")
+    assert torch.equal(seen.pop(), 0.5 * plain_seen)
+    assert torch.equal(grad_scores, 0.5 * plain_grad_scores)
+
+
+def test_mount_with_rule_hook_points_but_no_hook_out_raises_at_entry_without_leaking():
+    attn = _FakeAttention()
+    del attn.hook_out
+    block = _AttentionBlock(attn)
+    with pytest.raises(RelevanceRuleUnsupportedError, match="attn"):
+        with use_relevance_rules(block, RelevanceRules(attention=True)):
+            pass
+    assert _rule_hook_count(attn) == 0

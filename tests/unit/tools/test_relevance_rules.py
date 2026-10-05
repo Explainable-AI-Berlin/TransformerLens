@@ -1,4 +1,4 @@
-"""Analytic closed-form tests for the LN-, Identity-, and Half-relevance-rule primitives.
+"""Analytic closed-form tests for the LN-, Identity-, Half-rule and gradient-scaling primitives.
 
 Model-free: every primitive is a plain ``torch.autograd.Function`` exercised on
 synthetic tensors, so no model, backward hook, or ``.data`` access is involved. Each
@@ -20,6 +20,7 @@ from transformer_lens.model_bridge._relevance_rules import (
     half_rule,
     identity_rule,
     ln_rule,
+    scale_gradient,
 )
 from transformer_lens.model_bridge.generalized_components.mlp import (
     normalize_mlp_weight,
@@ -256,6 +257,36 @@ class TestHalfRule:
         assert torch.equal(y, u.detach() * v.detach())
 
         grad_out = torch.ones_like(u)
+        grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=grad_out)
+        torch.testing.assert_close(grad_u, 0.5 * grad_out * v.detach())
+        torch.testing.assert_close(grad_v, 0.5 * grad_out * u.detach())
+
+
+class TestScaleGradient:
+    """Forward is the identity; the VJP is the incoming gradient times a constant."""
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_forward_is_identity(self, dtype):
+        x = _sample_rows(dtype)
+        assert torch.equal(scale_gradient(x, 0.5), x)
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    @pytest.mark.parametrize("factor", [0.5, 0.0, 2.0])
+    def test_backward_scales_incoming_gradient(self, dtype, factor):
+        x = _leaf(_sample_rows(dtype), dtype)
+        grad_out = torch.arange(1, x.numel() + 1, dtype=dtype).reshape(x.shape)
+        y = scale_gradient(x, factor)
+        (grad_x,) = torch.autograd.grad(y, x, grad_outputs=grad_out)
+        torch.testing.assert_close(grad_x, factor * grad_out)
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_half_factor_on_a_product_matches_the_half_rule(self, dtype):
+        """Halving the gradient entering ``u * v`` is the Half-rule's per-factor split,
+        so scaling at the product (gated MLP) or at both factors (attention) reproduces it."""
+        u = _leaf(_sample_rows(dtype), dtype)
+        v = _leaf(_sample_rows(dtype).flip(0), dtype)
+        grad_out = torch.ones_like(u)
+        y = scale_gradient(u * v, 0.5)
         grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=grad_out)
         torch.testing.assert_close(grad_u, 0.5 * grad_out * v.detach())
         torch.testing.assert_close(grad_v, 0.5 * grad_out * u.detach())

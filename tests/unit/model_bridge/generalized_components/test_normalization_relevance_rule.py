@@ -1,13 +1,14 @@
-"""LN-rule integration on NormalizationBridge's native-autograd path.
+"""LN-rule integration on NormalizationBridge's native-autograd and python-norm paths.
 
 Covers the commit-5 contract: the rule-wrapped native forward is bit-identical to
 today's native forward by construction (the wrapping calls ``original_component(x)``
 itself rather than reproducing its numerics), the backward follows the LN-rule
 (denominator treated as constant) while weight/bias keep their ordinary gradient,
-targeting is positional so an ln1/ln2 mount that never reaches the native-autograd
-branch reports as skipped rather than silently leaving ordinary gradients in place,
-and a hook that would otherwise silently fall back instead raises while the rule is
-active.
+the python-norm path applies the same rule by dividing through ``ln_rule`` (so
+plain-LayerNorm families such as GPT-2 and the parameter-free Pre bridges are
+covered too), targeting is positional (the same class at ``attn.q_norm`` answers to
+"qk_normalization" only), and a hook that would otherwise silently fall back instead
+raises while the rule is active.
 """
 
 
@@ -96,6 +97,15 @@ class _Block(nn.Module):
         self.ln1 = norm
 
 
+class _QkNormBlock(nn.Module):
+    """Mounts a normalization bridge at the per-head attn.q_norm position."""
+
+    def __init__(self, norm: NormalizationBridge):
+        super().__init__()
+        self.attn = nn.Module()
+        self.attn.q_norm = norm
+
+
 def _make_bridge(
     native: bool,
     rms: bool = False,
@@ -142,9 +152,10 @@ def _denom_detached_oracle(
 
 
 class TestForwardIdentity:
+    @pytest.mark.parametrize("native", [True, False], ids=["native_autograd", "python_norm"])
     @pytest.mark.parametrize("rms", [False, True], ids=["layernorm", "rmsnorm"])
-    def test_active_forward_matches_inactive_forward(self, rms):
-        bridge = _make_bridge(native=True, rms=rms)
+    def test_active_forward_matches_inactive_forward(self, rms, native):
+        bridge = _make_bridge(native=native, rms=rms)
         block = _Block(bridge)
         x = torch.randn(2, 5, 16)
         baseline = bridge(x)
@@ -162,8 +173,9 @@ class TestForwardIdentity:
 
 
 class TestVJPMatchesDetachedDenomOracle:
-    def test_layernorm(self):
-        bridge = _make_bridge(native=True)
+    @pytest.mark.parametrize("native", [True, False], ids=["native_autograd", "python_norm"])
+    def test_layernorm(self, native):
+        bridge = _make_bridge(native=native)
         block = _Block(bridge)
         x = torch.randn(2, 5, 16, requires_grad=True)
         with use_relevance_rules(block, RelevanceRules(normalization=True)):
@@ -183,9 +195,10 @@ class TestVJPMatchesDetachedDenomOracle:
         y_oracle.sum().backward()
         torch.testing.assert_close(grad_rule, x_oracle.grad)
 
+    @pytest.mark.parametrize("native", [True, False], ids=["native_autograd", "python_norm"])
     @pytest.mark.parametrize("offset", [False, True], ids=["plain_rms", "gemma_offset"])
-    def test_rmsnorm(self, offset):
-        bridge = _make_bridge(native=True, rms=not offset, offset=offset)
+    def test_rmsnorm(self, offset, native):
+        bridge = _make_bridge(native=native, rms=not offset, offset=offset)
         block = _Block(bridge)
         x = torch.randn(2, 5, 16, requires_grad=True)
         with use_relevance_rules(block, RelevanceRules(normalization=True)):
@@ -205,9 +218,10 @@ class TestVJPMatchesDetachedDenomOracle:
         y_oracle.sum().backward()
         torch.testing.assert_close(grad_rule, x_oracle.grad)
 
-    def test_rule_grad_disagrees_with_ordinary_autodiff(self):
+    @pytest.mark.parametrize("native", [True, False], ids=["native_autograd", "python_norm"])
+    def test_rule_grad_disagrees_with_ordinary_autodiff(self, native):
         """The whole point of the rule: it must actually change the gradient."""
-        bridge = _make_bridge(native=True)
+        bridge = _make_bridge(native=native)
         block = _Block(bridge)
         x = torch.randn(2, 5, 16, requires_grad=True)
 
@@ -262,19 +276,13 @@ class TestRuleInactiveRegression:
         actual = bridge(x)
         assert torch.equal(actual, expected)
 
-    def test_non_native_path_rule_request_is_skipped_and_forward_unaffected(self):
-        """A python-norm-path bridge (no native autograd, no folding) never reaches
-        the branch the LN-rule wraps, so it must be reported skipped rather than
-        silently leaving ordinary gradients in place under a claimed rule."""
+    def test_python_norm_path_rule_request_is_installed(self):
+        """A python-norm-path bridge (no native autograd, no folding) divides through
+        ``ln_rule``, so it is a genuine rule target rather than a skipped mount."""
         bridge = _make_bridge(native=False)
-        block = _Block(bridge)
-        x = torch.randn(2, 5, 16)
-        baseline = bridge(x)
-        with use_relevance_rules(block, RelevanceRules(normalization=True)) as coverage:
-            assert coverage.installed == ()
-            assert coverage.skipped == ("ln1",)
-            active = bridge(x)
-        assert torch.equal(active, baseline)
+        with use_relevance_rules(_Block(bridge), RelevanceRules(normalization=True)) as coverage:
+            assert coverage.installed == ("ln1",)
+            assert coverage.skipped == ()
 
     def test_layer_norm_folding_config_flag_makes_the_rule_installable(self):
         """layer_norm_folding also dispatches through the native-autograd branch,
@@ -290,21 +298,93 @@ class TestRuleInactiveRegression:
         assert torch.equal(active, baseline)
 
     @pytest.mark.parametrize(
-        "bridge_cls", [LayerNormPreBridge, RMSNormPreBridge], ids=["ln_pre", "rms_pre"]
+        ("bridge_cls", "uses_rms"),
+        [(LayerNormPreBridge, False), (RMSNormPreBridge, True)],
+        ids=["ln_pre", "rms_pre"],
     )
-    def test_param_free_pre_norm_is_skipped_and_forward_unaffected(self, bridge_cls):
+    def test_param_free_pre_norm_applies_the_rule_with_unit_weight(self, bridge_cls, uses_rms):
         """LNPre/RMSPre always take the python-norm path regardless of the native
-        flag, so they must never be reported installed."""
+        flag; the rule applies there with no weight or bias in the way."""
         bridge = bridge_cls(name="ln1", config=_Cfg())
         bridge.set_original_component(nn.LayerNorm(16, eps=1e-5, elementwise_affine=False))
         block = _Block(bridge)
-        x = torch.randn(2, 5, 16)
+        x = torch.randn(2, 5, 16, requires_grad=True)
         baseline = bridge(x)
         with use_relevance_rules(block, RelevanceRules(normalization=True)) as coverage:
-            assert coverage.installed == ()
-            assert coverage.skipped == ("ln1",)
+            assert coverage.installed == ("ln1",)
             active = bridge(x)
+            active.sum().backward()
         assert torch.equal(active, baseline)
+
+        x_oracle = x.detach().clone().requires_grad_(True)
+        y_oracle = _denom_detached_oracle(
+            x_oracle, torch.ones(16), None, uses_rms=uses_rms, offset=False, eps=1e-5
+        )
+        y_oracle.sum().backward()
+        torch.testing.assert_close(x.grad, x_oracle.grad)
+
+
+class TestQkNormalizationMount:
+    @pytest.mark.parametrize("native", [True, False], ids=["native_autograd", "python_norm"])
+    def test_q_norm_mount_answers_only_to_qk_normalization(self, native):
+        bridge = _make_bridge(native=native, rms=True)
+        block = _QkNormBlock(bridge)
+        with use_relevance_rules(block, RelevanceRules(normalization=True)) as coverage:
+            assert coverage.installed == ()
+            assert bridge._relevance_rule_active is False
+        x = torch.randn(2, 4, 5, 16, requires_grad=True)
+        with use_relevance_rules(block, RelevanceRules(qk_normalization=True)) as coverage:
+            assert coverage.installed == ("attn.q_norm",)
+            bridge(x).sum().backward()
+
+        x_oracle = x.detach().clone().requires_grad_(True)
+        y_oracle = _denom_detached_oracle(
+            x_oracle, bridge.original_component.weight, None, uses_rms=True, offset=False, eps=1e-5
+        )
+        y_oracle.sum().backward()
+        torch.testing.assert_close(x.grad, x_oracle.grad)
+
+
+class TestPythonNormPathHooks:
+    """Unlike the native path, the python-norm path computes through its hook points,
+    so the rule composes with edits and leaves hook_normalized in the backward graph."""
+
+    def test_forward_edit_of_hook_scale_is_held_constant_by_the_rule(self):
+        bridge = _make_bridge(native=False)
+        x = torch.randn(2, 5, 16, requires_grad=True)
+        bridge.hook_scale.add_hook(lambda scale, hook: scale * 2.0)
+        try:
+            edited = bridge(x)
+            with use_relevance_rules(_Block(bridge), RelevanceRules(normalization=True)):
+                active = bridge(x)
+                active.sum().backward()
+        finally:
+            bridge.hook_scale.remove_hooks()
+        assert torch.equal(active, edited)
+
+        x_oracle = x.detach().clone().requires_grad_(True)
+        y_oracle = _denom_detached_oracle(
+            x_oracle,
+            bridge.original_component.weight / 2.0,
+            bridge.original_component.bias,
+            uses_rms=False,
+            offset=False,
+            eps=1e-5,
+        )
+        y_oracle.sum().backward()
+        torch.testing.assert_close(x.grad, x_oracle.grad)
+
+    def test_bwd_hook_on_hook_normalized_fires_while_rule_active(self):
+        bridge = _make_bridge(native=False)
+        x = torch.randn(2, 5, 16, requires_grad=True)
+        fired = []
+        bridge.hook_normalized.add_hook(lambda grad, hook: fired.append(grad), dir="bwd")
+        try:
+            with use_relevance_rules(_Block(bridge), RelevanceRules(normalization=True)):
+                bridge(x).sum().backward()
+        finally:
+            bridge.hook_normalized.remove_hooks(dir="bwd")
+        assert len(fired) == 1
 
 
 class TestMissingWeightTreatedAsIdentity:

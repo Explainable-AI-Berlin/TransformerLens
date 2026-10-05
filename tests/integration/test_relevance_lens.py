@@ -6,15 +6,18 @@ single-block harness, which only ever registers a canonical mount name
 fully assembled ``TransformerBridge``, where the same component is *also*
 reachable through the raw HF module tree under its own HF attribute name
 (for example ``blocks.0._original_component.input_layernorm``). These tests
-build a tiny random Qwen2 (the opaque gated-MLP native-forward path) and a tiny
-random Phi-3 (``JointGateUpMLPBridge``'s already-reconstructed forward)
-fully offline -- random weights from a programmatic HF config, no network
-access, no checkpoint download -- and exercise all three rules together on
-the real block stack: forward stays bit-identical, canonical mounts are
-actually found and installed, and the gradient each rule-active node passes
-upstream matches its closed-form VJP given the gradient it actually
-received downstream in the real graph.
+build a tiny random Qwen2 (the opaque gated-MLP native-forward path), a tiny
+random Qwen3 (per-head q_norm/k_norm under attn) and a tiny random Phi-3
+(``JointGateUpMLPBridge``'s already-reconstructed forward) fully offline --
+random weights from a programmatic HF config, no network access, no
+checkpoint download -- and exercise every rule together on the real block
+stack: forward stays bit-identical, canonical mounts are actually found and
+installed, and the gradient each rule-active node passes upstream matches
+its closed-form VJP given the gradient it actually received downstream in
+the real graph.
 """
+
+import dataclasses
 
 import pytest
 import torch
@@ -37,6 +40,9 @@ from transformer_lens.model_bridge.supported_architectures.phi3 import (
 )
 from transformer_lens.model_bridge.supported_architectures.qwen2 import (
     Qwen2ArchitectureAdapter,
+)
+from transformer_lens.model_bridge.supported_architectures.qwen3 import (
+    Qwen3ArchitectureAdapter,
 )
 
 TOKENS = torch.tensor([[1, 5, 7, 42, 9]])
@@ -81,15 +87,36 @@ def _build_phi3_bridge() -> TransformerBridge:
     return TransformerBridge(model=hf_model, adapter=adapter, tokenizer=_MockTokenizer())
 
 
+def _build_qwen3_bridge() -> TransformerBridge:
+    """Qwen3 adds per-head q_norm/k_norm RMSNorms under attn: the qk_normalization mounts."""
+    hf_config = AutoConfig.for_model("qwen3", head_dim=8, **TINY_DIMS)
+    torch.manual_seed(0)
+    hf_model = AutoModelForCausalLM.from_config(hf_config, attn_implementation="eager").eval()
+    bridge_config = build_bridge_config_from_hf(
+        hf_model.config, "Qwen3ForCausalLM", "qwen3-tiny", torch.float32
+    )
+    adapter = Qwen3ArchitectureAdapter(bridge_config)
+    return TransformerBridge(model=hf_model, adapter=adapter, tokenizer=_MockTokenizer())
+
+
 # Qwen2 exercises GatedMLPBridge's opaque native-forward path (the primary path
 # per real usage), where the rules attach to the live HF activation and down
 # projection; Phi-3 exercises JointGateUpMLPBridge's already-reconstructed
 # forward, isolating rule bugs from Bridge-integration bugs on the
-# fused-projection family.
+# fused-projection family. Qwen3 adds the per-head q_norm/k_norm mounts.
 FIXTURE_BUILDERS = {
     "qwen2": _build_qwen2_bridge,
+    "qwen3": _build_qwen3_bridge,
     "phi3": _build_phi3_bridge,
 }
+
+ALL_RULES = RelevanceRules(
+    normalization=True,
+    activation=True,
+    multiplicative_gate=True,
+    attention=True,
+    qk_normalization=True,
+)
 
 
 @pytest.fixture(scope="module", params=sorted(FIXTURE_BUILDERS), ids=sorted(FIXTURE_BUILDERS))
@@ -97,23 +124,33 @@ def bridge(request: pytest.FixtureRequest) -> TransformerBridge:
     return FIXTURE_BUILDERS[request.param]()
 
 
-def _expected_canonical_mounts() -> set[str]:
+def _expected_canonical_mounts(bridge: TransformerBridge) -> set[str]:
     ln_mounts = {f"blocks.{i}.ln1" for i in range(N_LAYERS)} | {
         f"blocks.{i}.ln2" for i in range(N_LAYERS)
     }
     mlp_mounts = {f"blocks.{i}.mlp" for i in range(N_LAYERS)}
-    return ln_mounts | mlp_mounts
+    attn_mounts = {f"blocks.{i}.attn" for i in range(N_LAYERS)}
+    qk_mounts: set[str] = set()
+    if "q_norm" in bridge.blocks[0].attn._modules:
+        qk_mounts = {
+            f"blocks.{i}.attn.{name}" for i in range(N_LAYERS) for name in ("q_norm", "k_norm")
+        }
+    return ln_mounts | {"ln_final"} | mlp_mounts | attn_mounts | qk_mounts
 
 
 class TestForwardIdentity:
-    def test_active_forward_matches_baseline_under_all_three_rules(
-        self, bridge: TransformerBridge
+    @pytest.mark.parametrize("attention_kind", ["attention", "attention_half"])
+    def test_active_forward_matches_baseline_under_all_rules(
+        self, bridge: TransformerBridge, attention_kind: str
     ) -> None:
+        rules = dataclasses.replace(
+            ALL_RULES,
+            attention=attention_kind == "attention",
+            attention_half=attention_kind == "attention_half",
+        )
         with torch.no_grad():
             baseline = bridge(TOKENS)
-        with use_relevance_rules(
-            bridge, RelevanceRules(normalization=True, activation=True, multiplicative_gate=True)
-        ):
+        with use_relevance_rules(bridge, rules):
             with torch.no_grad():
                 active = bridge(TOKENS)
         assert torch.equal(active, baseline)
@@ -123,11 +160,9 @@ class TestCoverage:
     def test_every_canonical_mount_is_installed_and_none_skipped(
         self, bridge: TransformerBridge
     ) -> None:
-        with use_relevance_rules(
-            bridge, RelevanceRules(normalization=True, activation=True, multiplicative_gate=True)
-        ) as coverage:
+        with use_relevance_rules(bridge, ALL_RULES) as coverage:
             pass
-        assert set(coverage.installed) == _expected_canonical_mounts()
+        assert set(coverage.installed) == _expected_canonical_mounts(bridge)
         assert coverage.skipped == ()
 
 
@@ -220,3 +255,44 @@ class TestGradientMatchesClosedFormOracle:
         torch.testing.assert_close(
             captured["mlp_grad_in"], expected_mlp_grad_in, atol=1e-5, rtol=1e-4
         )
+
+    def test_ln_final_and_qk_norm_rules_match_local_oracles(
+        self, bridge: TransformerBridge
+    ) -> None:
+        """The same local LN-rule check at the mounts this scope newly reaches: the
+        final norm and, on Qwen3, the per-head q_norm, whose input is
+        [batch, head, pos, d_head] rather than a residual-stream tensor."""
+        norms = {"ln_final": bridge.ln_final}
+        attn = bridge.blocks[0].attn
+        if "q_norm" in attn._modules:
+            norms["q_norm"] = attn.q_norm
+        captured: dict[str, torch.Tensor] = {}
+
+        def _capture(key: str):
+            def _hook(tensor: torch.Tensor, hook=None) -> None:
+                captured[key] = tensor.detach().clone()
+
+            return _hook
+
+        try:
+            for key, norm in norms.items():
+                norm.hook_in.add_hook(_capture(f"{key}_x"))
+                norm.hook_in.add_hook(_capture(f"{key}_grad_in"), dir="bwd")
+                norm.hook_out.add_hook(_capture(f"{key}_grad_out"), dir="bwd")
+            with use_relevance_rules(
+                bridge, RelevanceRules(normalization=True, qk_normalization=True)
+            ):
+                bridge(TOKENS).sum().backward()
+        finally:
+            for norm in norms.values():
+                norm.hook_in.remove_hooks(dir="both")
+                norm.hook_out.remove_hooks(dir="both")
+            for parameter in bridge.parameters():
+                parameter.grad = None
+
+        for key, norm in norms.items():
+            eps = getattr(norm.original_component, "variance_epsilon", 1e-6)
+            weight = norm.weight.detach()
+            denom = (captured[f"{key}_x"].pow(2).mean(-1, keepdim=True) + eps).sqrt()
+            expected = ln_rule_grad(captured[f"{key}_grad_out"] * weight, denom)
+            torch.testing.assert_close(captured[f"{key}_grad_in"], expected, atol=1e-5, rtol=1e-4)
