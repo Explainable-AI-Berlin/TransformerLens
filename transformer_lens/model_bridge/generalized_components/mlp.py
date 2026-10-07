@@ -2,7 +2,7 @@
 
 This module contains the bridge component for MLP layers.
 """
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -10,6 +10,23 @@ from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
 )
 from transformer_lens.utilities.quantization import require_readable_weight
+
+# Where HF MLP modules keep their activation: act_fn (Llama family), activation_fn
+# (Phi-3, GLM, OPT's decoder layer), act (GPT-2, OpenELM), activation
+# (GraniteMoeHybrid shared_mlp), gelu_impl (BLOOM). Missing one silently falls back
+# to cfg.act_fn -- which is how OpenELM ran ReLU instead of SiLU.
+_ACTIVATION_ATTRS = ("act_fn", "activation_fn", "act", "activation", "gelu_impl")
+
+
+def find_activation_fn(
+    component: Optional[torch.nn.Module],
+) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+    """The activation callable a wrapped HF MLP module keeps, if any."""
+    for attr in _ACTIVATION_ATTRS:
+        candidate = getattr(component, attr, None)
+        if callable(candidate):
+            return candidate
+    return None
 
 
 def weight_layout_in_out(proj: Any) -> Optional[bool]:
@@ -154,6 +171,11 @@ class MLPBridge(GeneralizedComponent):
         if out_module is not None and not out_module._fired_hook_out:
             output = out_module.hook_out(output)
         return output
+
+    @property
+    def activation_fn(self) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """The wrapped module's own activation (an ``ACT2FN`` module in most families)."""
+        return find_activation_fn(self.original_component)
 
     def _weight_layout_in_out(self, proj: Any) -> Optional[bool]:
         """Whether proj's wrapped module stores its weight as [in, out]."""

@@ -1,16 +1,14 @@
-"""Identity-/Half-rule integration on GatedMLPBridge's opaque native-forward path.
+"""Identity-/Half-rule on GatedMLPBridge's opaque native-forward path.
 
-The raw (non-fused) gated-MLP path keeps the HF module's own forward intact and
-installs the rules on its live submodules for a ``use_relevance_rules`` scope: the
-Identity-rule by swapping the module's activation callable, and the Half-rule by a
-forward-pre-hook that halves the gradient entering the down projection (the gate*up
-product). Because the real forward runs unchanged, anything it does beyond the core
-``down(act(gate) * up)`` shape -- a post-product multiplier, activation sparsity, the
-module's own hooks -- survives into the backward graph, and the rule VJP is taken
-through that real forward rather than a reconstruction of the core shape. The rules
-attach regardless of the projection weight class, so an opaque backing that is neither
-``nn.Linear`` nor ``Conv1D`` is still covered. Only the relu-family Identity-rule
-exclusion and the missing-activation-callable case remain unsupported.
+The HF module's own forward runs unchanged; the rules attach through hooks for a
+``use_relevance_rules`` scope: the Identity-rule on the module's activation (an
+``ACT2FN``-style module), the Half-rule on ``hook_post``, the gate*up product entering
+the down projection. Anything the real forward does beyond the core
+``down(act(gate) * up)`` shape -- a post-product multiplier, the module's own hooks --
+stays in the backward graph, and the rules attach regardless of the projection weight
+class. An activation the Identity-rule does not apply to (``f(0) != 0``) is refused,
+and one that is a bare function rather than a module cannot be hooked, so it is
+skipped.
 """
 
 import pytest
@@ -22,8 +20,6 @@ from transformers.pytorch_utils import Conv1D
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRules,
     RelevanceRuleUnsupportedError,
-    half_rule,
-    identity_rule,
     use_relevance_rules,
 )
 from transformer_lens.model_bridge.generalized_components.base import (
@@ -40,19 +36,13 @@ class _Cfg:
         self.hidden_act = hidden_act
 
 
-class _ReluSquared(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(x).square()
-
-
-_ACTIVATIONS = {"silu": nn.SiLU, "relu2": _ReluSquared}
+_ACTIVATIONS = {"silu": nn.SiLU, "sigmoid": nn.Sigmoid}
 
 
 class _OpaqueProj(nn.Module):
     """Weight-backed projection that is neither nn.Linear nor Conv1D.
 
-    Stands in for a backing class the retired weight-orientation allowlist would
-    have refused; the rules now attach without reading its weights at all.
+    The rules attach through hooks, so they never read the projection's weights.
     """
 
     def __init__(self, d_in: int, d_out: int, bias: bool = True):
@@ -69,7 +59,7 @@ class _TinyGatedMLP(nn.Module):
     """Mirrors the Qwen2/Llama/Gemma gated-MLP: one opaque call over its own submodules.
 
     The activation is an ``nn.Module`` attribute the forward calls, matching the
-    ``ACT2FN`` shape the Identity-rule wrap targets.
+    ``ACT2FN`` shape the Identity-rule hooks.
     """
 
     def __init__(self, gate_proj, up_proj, down_proj, hidden_act: str = "silu"):
@@ -144,6 +134,10 @@ def _wire_bridge(hf_mlp: nn.Module, config: _Cfg) -> GatedMLPBridge:
     gate_bridge.set_original_component(hf_mlp.gate_proj)
     in_bridge.set_original_component(hf_mlp.up_proj)
     out_bridge.set_original_component(hf_mlp.down_proj)
+    # As at bridge boot: the HF module calls the projection bridges in place of its own
+    # projections, and hook_pre/hook_pre_linear/hook_post resolve.
+    hf_mlp.gate_proj, hf_mlp.up_proj, hf_mlp.down_proj = gate_bridge, in_bridge, out_bridge
+    bridge._register_aliases()
     return bridge
 
 
@@ -174,12 +168,13 @@ def _oracle_grads(hf_mlp, x, activation_active, gate_active, multiplier: float =
     x_oracle = x.detach().clone().requires_grad_(True)
     gate_output = hf_mlp.gate_proj(x_oracle)
     up_output = hf_mlp.up_proj(x_oracle)
-    activated = (
-        identity_rule(gate_output, hf_mlp.act_fn)
-        if activation_active
-        else hf_mlp.act_fn(gate_output)
-    )
-    gated = half_rule(activated, up_output) if gate_active else activated * up_output
+    # The rules as written in the pinned RelP reference (gate outputs are nonzero here).
+    activated = hf_mlp.act_fn(gate_output)
+    if activation_active:
+        activated = gate_output * (activated / gate_output).detach()
+    gated = activated * up_output
+    if gate_active:
+        gated = gated / 2 + (gated / 2).detach()
     down = hf_mlp.down_proj(gated) * multiplier
     down.sum().backward()
     grads = {n: p.grad.clone() for n, p in hf_mlp.named_parameters()}
@@ -191,23 +186,22 @@ BACKING_CLASSES = ["nn.Linear", "Conv1D", "opaque"]
 
 class TestGatedMLPRelevanceRuleCapability:
     @pytest.mark.parametrize("backing_class", BACKING_CLASSES)
-    def test_capable_of_both_kinds_regardless_of_weight_backing(self, backing_class):
+    def test_both_kinds_install_regardless_of_weight_backing(self, backing_class):
         block, _ = _make_bridge(backing_class)
-        assert set(block.mlp._relevance_rule_kinds) == {"activation", "multiplicative_gate"}
+        rules = RelevanceRules(activation=True, multiplicative_gate=True)
+        with use_relevance_rules(block, rules) as coverage:
+            assert coverage.installed == ("mlp", "mlp")
 
-    def test_identity_rule_unsupported_for_relu_squared_activation(self):
-        block, _ = _make_bridge("nn.Linear", hidden_act="relu2")
-        assert block.mlp._relevance_rule_kinds == ("multiplicative_gate",)
-
+    def test_identity_rule_unsupported_for_sigmoid_activation(self):
+        block, _ = _make_bridge("nn.Linear", hidden_act="sigmoid")
         with pytest.raises(RelevanceRuleUnsupportedError, match="mlp"):
             with use_relevance_rules(block, RelevanceRules(activation=True)):
                 pass
 
-    def test_activation_unsupported_when_no_activation_callable_is_exposed(self):
-        # A gated MLP whose forward uses a bare function has no callable activation
-        # attribute for the Identity-rule to wrap, so requesting it must raise rather
-        # than install a silent no-op. The Half-rule needs no activation access and
-        # stays available.
+    def test_activation_skipped_when_no_activation_module_is_exposed(self):
+        # A gated MLP whose forward uses a bare function has no activation module for
+        # the Identity-rule to hook, so the mount is reported skipped. The Half-rule
+        # needs no activation access and stays available.
         class _FunctionalActMLP(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -222,13 +216,13 @@ class TestGatedMLPRelevanceRuleCapability:
         bridge = _wire_bridge(_FunctionalActMLP(), _Cfg("silu"))
         block = _Block(bridge)
 
-        assert bridge._relevance_rule_kinds == ("multiplicative_gate",)
-        with pytest.raises(RelevanceRuleUnsupportedError, match="mlp"):
-            with use_relevance_rules(block, RelevanceRules(activation=True)):
-                pass
+        with use_relevance_rules(block, RelevanceRules(activation=True)) as coverage:
+            assert coverage.skipped == ("mlp",)
+        with use_relevance_rules(block, RelevanceRules(multiplicative_gate=True)) as coverage:
+            assert coverage.installed == ("mlp",)
 
-    def test_half_rule_remains_available_under_relu_squared_activation(self):
-        block, _ = _make_bridge("nn.Linear", hidden_act="relu2")
+    def test_half_rule_remains_available_under_sigmoid_activation(self):
+        block, _ = _make_bridge("nn.Linear", hidden_act="sigmoid")
         x = torch.randn(2, 4)
         baseline = block(x)
         with use_relevance_rules(block, RelevanceRules(multiplicative_gate=True)) as coverage:
@@ -254,18 +248,11 @@ class TestGatedMLPRelevanceRuleForwardIdentity:
             active = block(x)
         assert torch.equal(active, baseline)
 
-    @pytest.mark.parametrize("backing_class", BACKING_CLASSES)
-    def test_forward_unchanged_when_rule_inactive(self, backing_class):
-        block, _ = _make_bridge(backing_class)
-        x = torch.randn(3, 4)
-        assert torch.equal(block(x), block(x))
-
-    def test_activation_callable_restored_after_scope(self):
+    def test_activation_module_left_unhooked_after_scope(self):
         block, hf_mlp = _make_bridge("nn.Linear")
-        original_act = hf_mlp._modules["act_fn"]
         with use_relevance_rules(block, RelevanceRules(activation=True)):
-            assert hf_mlp._modules["act_fn"] is not original_act
-        assert hf_mlp._modules["act_fn"] is original_act
+            assert hf_mlp.act_fn._forward_hooks
+        assert not hf_mlp.act_fn._forward_hooks
 
 
 class TestGatedMLPRelevanceRuleVJP:
@@ -395,7 +382,7 @@ class TestGatedMLPRelevanceRulePreservesRealForward:
 
 class TestGatedMLPRelevanceRuleCompatibilityMode:
     """The processed-weights (compatibility) path reconstructs the forward from folded
-    weights, so it applies the rules inline; before this it skipped them entirely."""
+    weights but calls the module's own activation, so the same hooks apply."""
 
     def _make_compat_bridge(self, bias: bool = True):
         block, hf_mlp = _make_bridge("nn.Linear", bias=bias)

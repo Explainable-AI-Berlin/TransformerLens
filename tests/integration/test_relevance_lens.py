@@ -25,9 +25,6 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRules,
-    half_rule,
-    identity_rule,
-    ln_rule_grad,
     use_relevance_rules,
 )
 from transformer_lens.model_bridge.bridge import TransformerBridge
@@ -174,10 +171,10 @@ class TestGradientMatchesClosedFormOracle:
     tests), so the only thing a real multi-block graph can newly break is the
     wiring: the wrong node's weights, a disconnected graph path, or a mount
     that silently never resolves so its rule never activates. Tapping
-    hook_in/hook_out -- outside the LN-rule's fail-closed
-    hook_scale/hook_normalized guard -- exposes exactly the gradient each node
-    passes upstream and the gradient it receives from downstream, with no
-    need to reconstruct attention or the rest of the stack by hand.
+    hook_in/hook_out exposes exactly the gradient each node passes upstream and
+    the gradient it receives from downstream, with no need to reconstruct
+    attention or the rest of the stack by hand. The oracles write each rule as
+    in the pinned RelP reference.
     """
 
     def test_ln_rule_and_gated_mlp_rule_match_local_oracles(
@@ -219,7 +216,7 @@ class TestGradientMatchesClosedFormOracle:
         eps = getattr(ln1.original_component, "variance_epsilon", 1e-6)
         weight = ln1.weight.detach()
         denom = (captured["ln_x"].pow(2).mean(-1, keepdim=True) + eps).sqrt()
-        expected_ln_grad_in = ln_rule_grad(captured["ln_grad_out"] * weight, denom)
+        expected_ln_grad_in = captured["ln_grad_out"] * weight / denom
         torch.testing.assert_close(
             captured["ln_grad_in"], expected_ln_grad_in, atol=1e-5, rtol=1e-4
         )
@@ -244,8 +241,9 @@ class TestGradientMatchesClosedFormOracle:
             up_output = x @ w_in
             if b_in is not None:
                 up_output = up_output + b_in
-            activated = identity_rule(gate_output, act_fn)
-            gated = half_rule(activated, up_output)
+            activated = gate_output * (act_fn(gate_output) / gate_output).detach()
+            gated = activated * up_output
+            gated = gated / 2 + (gated / 2).detach()
             down = gated @ w_out
             if b_out is not None:
                 down = down + b_out
@@ -294,5 +292,5 @@ class TestGradientMatchesClosedFormOracle:
             eps = getattr(norm.original_component, "variance_epsilon", 1e-6)
             weight = norm.weight.detach()
             denom = (captured[f"{key}_x"].pow(2).mean(-1, keepdim=True) + eps).sqrt()
-            expected = ln_rule_grad(captured[f"{key}_grad_out"] * weight, denom)
+            expected = captured[f"{key}_grad_out"] * weight / denom
             torch.testing.assert_close(captured[f"{key}_grad_in"], expected, atol=1e-5, rtol=1e-4)

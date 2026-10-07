@@ -6,14 +6,12 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from transformer_lens.model_bridge._relevance_rules import half_rule, identity_rule
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
     align_offloaded_subtree,
 )
 from transformer_lens.model_bridge.generalized_components.gated_mlp import (
     GatedMLPBridge,
-    identity_rule_supports_activation,
     resolve_activation_fn,
 )
 from transformer_lens.model_bridge.generalized_components.linear import LinearBridge
@@ -63,9 +61,6 @@ class JointGateUpMLPBridge(GatedMLPBridge):
         self.real_components["in"] = ("in", _up_bridge)
         if hasattr(self, "out"):
             self.real_components["out"] = ("out", self.out)
-
-        # Typed as Any: HF exposes activation_fn as nn.Module (e.g. nn.SiLU)
-        self._activation_fn: Any = None
 
         self._register_state_dict_hook(JointGateUpMLPBridge._filter_gate_up_state_dict)
         self.register_load_state_dict_pre_hook(
@@ -159,45 +154,6 @@ class JointGateUpMLPBridge(GatedMLPBridge):
         self.gate.set_original_component(gate_proj)
         getattr(self, "in").set_original_component(up_proj)
 
-        # Capture activation function from original component. Attr names vary:
-        # activation_fn/act_fn (phi3, glm), act (OpenELM), activation
-        # (GraniteMoeHybrid shared_mlp). Missing one silently falls back to
-        # cfg.act_fn — which is how OpenELM ran ReLU instead of SiLU.
-        for attr in ("activation_fn", "act_fn", "act", "activation"):
-            candidate = getattr(original_component, attr, None)
-            if callable(candidate):
-                self._activation_fn = candidate
-                break
-
-    def _resolve_activation_fn(self) -> Callable:
-        """Resolve the activation function for the reconstructed forward pass."""
-        if self._activation_fn is not None:
-            return self._activation_fn
-        return resolve_activation_fn(self.config)
-
-    def _activation_rule_installable(self) -> bool:
-        """The reconstructed forward calls the activation itself, so only the config
-        activation form gates the Identity-rule; the opaque-path requirement of a
-        wrappable activation callable does not apply here."""
-        return identity_rule_supports_activation(self.config)
-
-    # The reconstructed forward applies both rules inline off the boolean flags set
-    # by the base ``_enable_relevance_rule``/``_disable_relevance_rule``. The
-    # opaque-path installers must stay disabled: the gate hook lives on the shared
-    # down projection this forward also calls, so leaving it active would halve the
-    # gate*up gradient a second time on top of the inline ``half_rule``.
-    def _install_activation_rule(self) -> None:
-        return None
-
-    def _teardown_activation_rule(self) -> None:
-        return None
-
-    def _install_gate_rule(self) -> None:
-        return None
-
-    def _teardown_gate_rule(self) -> None:
-        return None
-
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Reconstructed gated MLP forward with individual hook access."""
         # Delegate to GatedMLPBridge's processed-weights path only when ALL
@@ -215,17 +171,10 @@ class JointGateUpMLPBridge(GatedMLPBridge):
         gate_output = self.gate(hidden_states)
         up_output = getattr(self, "in")(hidden_states)
 
-        act_fn = self._resolve_activation_fn()
-        activated = (
-            identity_rule(gate_output, act_fn)
-            if self._relevance_rule_activation_active
-            else act_fn(gate_output)
-        )
-        gated = (
-            half_rule(activated, up_output)
-            if self._relevance_rule_gate_active
-            else activated * up_output
-        )
+        act_fn = self.activation_fn
+        if act_fn is None:
+            act_fn = resolve_activation_fn(self.config)
+        gated = act_fn(gate_output) * up_output
 
         if hasattr(self, "out") and self.out is not None:
             output = self.out(gated)

@@ -1,10 +1,10 @@
-"""Analytic closed-form tests for the LN-, Identity-, Half-rule and gradient-scaling primitives.
+"""Analytic closed-form tests for the Identity-rule primitive.
 
-Model-free: every primitive is a plain ``torch.autograd.Function`` exercised on
-synthetic tensors, so no model, backward hook, or ``.data`` access is involved. Each
-test asserts two properties independently: the forward value is exactly the native
-(ordinary-autograd) value, and the backward value matches the rule's closed-form VJP
-rather than what ordinary autodiff would produce.
+Model-free: the primitive is a plain ``torch.autograd.Function`` exercised on
+synthetic tensors. Each test asserts two properties independently: the forward value
+is exactly the activation's own output, and the backward value matches the rule's
+closed-form VJP rather than what ordinary autodiff would produce. The other rules are
+plain detaches and gradient halvings at hook points, tested where they are applied.
 """
 
 import math
@@ -16,12 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.pytorch_utils import Conv1D
 
-from transformer_lens.model_bridge._relevance_rules import (
-    half_rule,
-    identity_rule,
-    ln_rule,
-    scale_gradient,
-)
+from transformer_lens.model_bridge._relevance_rules import _slope_at_zero, identity_rule
 from transformer_lens.model_bridge.generalized_components.mlp import (
     normalize_mlp_weight,
     weight_layout_in_out,
@@ -51,78 +46,8 @@ def _normal_cdf(x: torch.Tensor) -> torch.Tensor:
     return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
 
-class TestLNRule:
-    """Forward equals ``numerator / denom``; the VJP treats ``denom`` as constant."""
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_forward_matches_plain_division(self, dtype):
-        numerator = _sample_rows(dtype)
-        denom = numerator.abs().mean(dim=-1, keepdim=True) + 1e-6
-        assert torch.equal(ln_rule(numerator, denom), numerator / denom)
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_backward_treats_denom_as_constant(self, dtype):
-        eps = 1e-6
-        base = _sample_rows(dtype)
-        grad_out = torch.ones_like(base)
-
-        x_rule = _leaf(base, dtype)
-        denom_rule = x_rule.abs().mean(dim=-1, keepdim=True) + eps
-        y_rule = ln_rule(x_rule, denom_rule)
-        (grad_rule,) = torch.autograd.grad(y_rule, x_rule, grad_outputs=grad_out)
-
-        # The closed-form VJP of this rule: grad_x = grad_out / denom, with no
-        # contribution from d(denom)/dx.
-        expected = grad_out / denom_rule.detach()
-        torch.testing.assert_close(grad_rule, expected)
-
-        # Plain autodiff through the same expression differentiates the denom too,
-        # so it disagrees with the rule everywhere the denom actually depends on x
-        # (every row here, since eps alone would zero out that dependency).
-        x_plain = _leaf(base, dtype)
-        denom_plain = x_plain.abs().mean(dim=-1, keepdim=True) + eps
-        y_plain = x_plain / denom_plain
-        (grad_plain,) = torch.autograd.grad(y_plain, x_plain, grad_outputs=grad_out)
-        assert not torch.allclose(grad_plain, grad_rule)
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_backward_zero_row_has_no_division_by_zero(self, dtype):
-        eps = 1e-6
-        x = _leaf(_sample_rows(dtype)[:1], dtype)
-        denom = x.abs().mean(dim=-1, keepdim=True) + eps
-        y = ln_rule(x, denom)
-        (grad,) = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(x))
-        assert torch.isfinite(grad).all()
-        torch.testing.assert_close(grad, torch.full_like(x, 1.0 / eps))
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_forward_and_backward_on_non_contiguous_input(self, dtype):
-        base = _sample_rows(dtype).t()
-        assert not base.is_contiguous()
-        numerator = base.clone().requires_grad_(True)
-        denom = numerator.abs().mean(dim=-1, keepdim=True) + 1e-6
-
-        y = ln_rule(numerator, denom)
-        assert torch.equal(y, numerator.detach() / denom.detach())
-
-        grad_out = torch.ones_like(numerator)
-        (grad,) = torch.autograd.grad(y, numerator, grad_outputs=grad_out)
-        torch.testing.assert_close(grad, grad_out / denom.detach())
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_batched_leading_dims(self, dtype):
-        numerator = _leaf(torch.randn(2, 3, 4), dtype)
-        denom = numerator.abs().mean(dim=-1, keepdim=True) + 1e-6
-        y = ln_rule(numerator, denom)
-        assert y.shape == numerator.shape
-        assert torch.equal(y, numerator.detach() / denom.detach())
-
-        (grad,) = torch.autograd.grad(y, numerator, grad_outputs=torch.ones_like(numerator))
-        torch.testing.assert_close(grad, torch.ones_like(numerator) / denom.detach())
-
-
 class TestIdentityRule:
-    """Forward equals the native activation; the VJP is ``grad_out * phi(x)``.
+    """Forward returns the activation output; the VJP is ``grad_out * phi(x)``.
 
     ``phi`` has a closed form for each activation tested here: ``sigmoid`` for SiLU
     and the Gaussian CDF for exact GELU. Both are, by construction, the removable-
@@ -133,12 +58,12 @@ class TestIdentityRule:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_forward_matches_native_silu(self, dtype):
         x = _sample_rows(dtype)
-        assert torch.equal(identity_rule(x, F.silu), F.silu(x))
+        assert torch.equal(identity_rule(x, F.silu(x)), F.silu(x))
 
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_backward_matches_sigmoid_for_silu(self, dtype):
         x = _leaf(_sample_rows(dtype), dtype)
-        y = identity_rule(x, F.silu)
+        y = identity_rule(x, F.silu(x))
         grad_out = torch.ones_like(x)
         (grad,) = torch.autograd.grad(y, x, grad_outputs=grad_out)
         torch.testing.assert_close(grad, grad_out * torch.sigmoid(x))
@@ -147,13 +72,13 @@ class TestIdentityRule:
     def test_forward_matches_native_gelu_exact(self, dtype):
         x = _sample_rows(dtype)
         act_fn = partial(F.gelu, approximate="none")
-        assert torch.equal(identity_rule(x, act_fn), act_fn(x))
+        assert torch.equal(identity_rule(x, act_fn(x)), act_fn(x))
 
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_backward_matches_gaussian_cdf_for_exact_gelu(self, dtype):
         x = _leaf(_sample_rows(dtype), dtype)
         act_fn = partial(F.gelu, approximate="none")
-        y = identity_rule(x, act_fn)
+        y = identity_rule(x, act_fn(x))
         grad_out = torch.ones_like(x)
         (grad,) = torch.autograd.grad(y, x, grad_outputs=grad_out)
         torch.testing.assert_close(grad, grad_out * _normal_cdf(x))
@@ -162,13 +87,13 @@ class TestIdentityRule:
     def test_forward_matches_native_gelu_approx(self, dtype):
         x = _sample_rows(dtype)
         act_fn = partial(F.gelu, approximate="tanh")
-        assert torch.equal(identity_rule(x, act_fn), act_fn(x))
+        assert torch.equal(identity_rule(x, act_fn(x)), act_fn(x))
 
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_backward_matches_ratio_with_zero_limit_for_approx_gelu(self, dtype):
         x = _leaf(_sample_rows(dtype), dtype)
         act_fn = partial(F.gelu, approximate="tanh")
-        y = identity_rule(x, act_fn)
+        y = identity_rule(x, act_fn(x))
         grad_out = torch.ones_like(x)
         (grad,) = torch.autograd.grad(y, x, grad_outputs=grad_out)
 
@@ -184,7 +109,7 @@ class TestIdentityRule:
         assert not base.is_contiguous()
         x = base.clone().requires_grad_(True)
 
-        y = identity_rule(x, F.silu)
+        y = identity_rule(x, F.silu(x))
         assert torch.equal(y, F.silu(x.detach()))
 
         grad_out = torch.ones_like(x)
@@ -194,7 +119,7 @@ class TestIdentityRule:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_batched_leading_dims(self, dtype):
         x = _leaf(torch.randn(2, 3, 4), dtype)
-        y = identity_rule(x, F.silu)
+        y = identity_rule(x, F.silu(x))
         assert y.shape == x.shape
         assert torch.equal(y, F.silu(x.detach()))
 
@@ -202,94 +127,31 @@ class TestIdentityRule:
         torch.testing.assert_close(grad, torch.sigmoid(x.detach()))
 
 
-class TestHalfRule:
-    """Forward equals ``u * v``; the VJP halves each ordinary product-rule term."""
+class TestSlopeAtZero:
+    """The Identity-rule's precondition and its ratio at ``x == 0``, read off the
+    activation module: ``f'(0)`` for an elementwise ``f`` with ``f(0) == 0``."""
 
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_forward_matches_plain_product(self, dtype):
-        u = _sample_rows(dtype)
-        v = _sample_rows(dtype).flip(0)
-        assert torch.equal(half_rule(u, v), u * v)
+    @pytest.mark.parametrize(
+        ("activation", "slope"),
+        [(nn.SiLU(), 0.5), (nn.GELU(), 0.5), (nn.GELU(approximate="tanh"), 0.5), (nn.Tanh(), 1.0)],
+        ids=["silu", "gelu", "gelu_tanh", "tanh"],
+    )
+    def test_slope_of_supported_activations(self, activation, slope):
+        assert _slope_at_zero(activation) == pytest.approx(slope)
 
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_backward_halves_each_operand_gradient(self, dtype):
-        u = _leaf(_sample_rows(dtype), dtype)
-        v = _leaf(_sample_rows(dtype).flip(0), dtype)
-        grad_out = torch.ones_like(u)
+    @pytest.mark.parametrize(
+        "activation",
+        [nn.Sigmoid(), nn.GLU(), nn.ReLU(inplace=True)],
+        ids=["sigmoid", "glu", "relu_"],
+    )
+    def test_refuses_nonzero_at_zero_and_shape_changing(self, activation):
+        expected = 0.0 if isinstance(activation, nn.ReLU) else None
+        assert _slope_at_zero(activation) == expected
 
-        y = half_rule(u, v)
-        grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=grad_out)
-        torch.testing.assert_close(grad_u, 0.5 * grad_out * v.detach())
-        torch.testing.assert_close(grad_v, 0.5 * grad_out * u.detach())
-
-        # Ordinary autodiff of u * v would give the full (unhalved) product-rule
-        # terms, so the rule must disagree with it.
-        u_plain = _leaf(_sample_rows(dtype), dtype)
-        v_plain = _leaf(_sample_rows(dtype).flip(0), dtype)
-        y_plain = u_plain * v_plain
-        grad_u_plain, grad_v_plain = torch.autograd.grad(
-            y_plain, (u_plain, v_plain), grad_outputs=grad_out
-        )
-        assert not torch.allclose(grad_u_plain, grad_u)
-        assert not torch.allclose(grad_v_plain, grad_v)
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_forward_and_backward_on_non_contiguous_input(self, dtype):
-        u = _sample_rows(dtype).t().clone().requires_grad_(True)
-        v = _sample_rows(dtype).flip(0).t().clone().requires_grad_(True)
-        assert not u.is_contiguous()
-        assert not v.is_contiguous()
-
-        y = half_rule(u, v)
-        assert torch.equal(y, u.detach() * v.detach())
-
-        grad_out = torch.ones_like(u)
-        grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=grad_out)
-        torch.testing.assert_close(grad_u, 0.5 * grad_out * v.detach())
-        torch.testing.assert_close(grad_v, 0.5 * grad_out * u.detach())
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_batched_leading_dims(self, dtype):
-        u = _leaf(torch.randn(2, 3, 4), dtype)
-        v = _leaf(torch.randn(2, 3, 4), dtype)
-        y = half_rule(u, v)
-        assert y.shape == u.shape
-        assert torch.equal(y, u.detach() * v.detach())
-
-        grad_out = torch.ones_like(u)
-        grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=grad_out)
-        torch.testing.assert_close(grad_u, 0.5 * grad_out * v.detach())
-        torch.testing.assert_close(grad_v, 0.5 * grad_out * u.detach())
-
-
-class TestScaleGradient:
-    """Forward is the identity; the VJP is the incoming gradient times a constant."""
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_forward_is_identity(self, dtype):
-        x = _sample_rows(dtype)
-        assert torch.equal(scale_gradient(x, 0.5), x)
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    @pytest.mark.parametrize("factor", [0.5, 0.0, 2.0])
-    def test_backward_scales_incoming_gradient(self, dtype, factor):
-        x = _leaf(_sample_rows(dtype), dtype)
-        grad_out = torch.arange(1, x.numel() + 1, dtype=dtype).reshape(x.shape)
-        y = scale_gradient(x, factor)
-        (grad_x,) = torch.autograd.grad(y, x, grad_outputs=grad_out)
-        torch.testing.assert_close(grad_x, factor * grad_out)
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_half_factor_on_a_product_matches_the_half_rule(self, dtype):
-        """Halving the gradient entering ``u * v`` is the Half-rule's per-factor split,
-        so scaling at the product (gated MLP) or at both factors (attention) reproduces it."""
-        u = _leaf(_sample_rows(dtype), dtype)
-        v = _leaf(_sample_rows(dtype).flip(0), dtype)
-        grad_out = torch.ones_like(u)
-        y = scale_gradient(u * v, 0.5)
-        grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=grad_out)
-        torch.testing.assert_close(grad_u, 0.5 * grad_out * v.detach())
-        torch.testing.assert_close(grad_v, 0.5 * grad_out * u.detach())
+    def test_ratio_at_zero_uses_the_given_slope(self):
+        x = torch.zeros(3, requires_grad=True)
+        (grad,) = torch.autograd.grad(identity_rule(x, torch.tanh(x), 1.0).sum(), x)
+        torch.testing.assert_close(grad, torch.ones(3))
 
 
 class _Proj:
@@ -352,32 +214,21 @@ class TestPinnedReferenceParity:
     rule formulas are reimplemented here directly from the pinned commit's
     component diffs rather than imported:
 
-    - LN-rule (``transformer_lens/components/rms_norm.py``): ``x / scale.detach()``.
     - Identity-rule (``transformer_lens/utilities/activation_functions.py``,
       class ``ModifiedAct``): ``zp = stabilize(x); zp * (act_fn(x) / zp).detach()``,
       where ``stabilize(z) = z + ((z == 0) + sign(z)) * 1e-6``
       (``transformer_lens/lrp_utils.py``).
-    - Half-rule (``transformer_lens/components/mlps/gated_mlp.py``):
-      ``z = u * v; z / 2 + (z / 2).detach()``.
 
-    The LN- and Half-rule reference formulas produce the same VJP as this module's
-    primitives to floating-point precision. The Identity-rule reference formula
-    does not: its epsilon stabilizer only approximates the paper-defined factor
-    away from ``x == 0``, and collapses to exactly zero at ``x == 0`` where the
-    paper-defined factor's removable-singularity limit is ``0.5``.
+    The reference formula's epsilon stabilizer only approximates the paper-defined
+    factor away from ``x == 0``, and collapses to exactly zero at ``x == 0`` where the
+    paper-defined factor's removable-singularity limit is ``0.5``. The reference's
+    LN-rule (``x / scale.detach()``) and Half-rule (``z / 2 + (z / 2).detach()``) are
+    checked against the bridge in the normalization and gated-MLP tests.
     """
 
     @staticmethod
     def _reference_stabilize(z: torch.Tensor) -> torch.Tensor:
         return z + ((z == 0).to(z.dtype) + torch.sign(z)) * 1e-6
-
-    @classmethod
-    def _reference_ln_rule_grad(cls, x: torch.Tensor, denom_fn) -> torch.Tensor:
-        x = x.clone().requires_grad_(True)
-        denom = denom_fn(x)
-        y = x / denom.detach()
-        (grad,) = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(x))
-        return grad
 
     @classmethod
     def _reference_identity_rule_grad(cls, x: torch.Tensor, act_fn) -> torch.Tensor:
@@ -387,30 +238,6 @@ class TestPinnedReferenceParity:
         y = zp * (z / zp).detach()
         (grad,) = torch.autograd.grad(y, x, grad_outputs=torch.ones_like(x))
         return grad
-
-    @classmethod
-    def _reference_half_rule_grad(cls, u: torch.Tensor, v: torch.Tensor):
-        u = u.clone().requires_grad_(True)
-        v = v.clone().requires_grad_(True)
-        z = u * v
-        y = z / 2 + (z / 2).detach()
-        grad_u, grad_v = torch.autograd.grad(y, (u, v), grad_outputs=torch.ones_like(u))
-        return grad_u, grad_v
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_ln_rule_matches_reference_grad(self, dtype):
-        def denom_fn(t: torch.Tensor) -> torch.Tensor:
-            return (t.pow(2).mean(-1, keepdim=True) + 1e-6).sqrt()
-
-        x = _sample_rows(dtype)
-
-        x_rule = _leaf(x, dtype)
-        denom_rule = denom_fn(x_rule)
-        y_rule = ln_rule(x_rule, denom_rule)
-        (grad_rule,) = torch.autograd.grad(y_rule, x_rule, grad_outputs=torch.ones_like(x_rule))
-
-        grad_reference = self._reference_ln_rule_grad(x, denom_fn)
-        torch.testing.assert_close(grad_rule, grad_reference)
 
     @pytest.mark.parametrize("dtype", DTYPES)
     @pytest.mark.parametrize(
@@ -423,7 +250,7 @@ class TestPinnedReferenceParity:
         nonzero_mask = x != 0
 
         x_rule = _leaf(x, dtype)
-        y_rule = identity_rule(x_rule, act_fn)
+        y_rule = identity_rule(x_rule, act_fn(x_rule))
         (grad_rule,) = torch.autograd.grad(y_rule, x_rule, grad_outputs=torch.ones_like(x_rule))
 
         grad_reference = self._reference_identity_rule_grad(x, act_fn)
@@ -451,25 +278,9 @@ class TestPinnedReferenceParity:
         x = torch.zeros(3, dtype=dtype)
 
         x_rule = _leaf(x, dtype)
-        y_rule = identity_rule(x_rule, act_fn)
+        y_rule = identity_rule(x_rule, act_fn(x_rule))
         (grad_rule,) = torch.autograd.grad(y_rule, x_rule, grad_outputs=torch.ones_like(x_rule))
         torch.testing.assert_close(grad_rule, torch.full_like(x, 0.5))
 
         grad_reference = self._reference_identity_rule_grad(x, act_fn)
         torch.testing.assert_close(grad_reference, torch.zeros_like(x))
-
-    @pytest.mark.parametrize("dtype", DTYPES)
-    def test_half_rule_matches_reference_grad(self, dtype):
-        u = _sample_rows(dtype)
-        v = _sample_rows(dtype).flip(0)
-
-        u_rule = _leaf(u, dtype)
-        v_rule = _leaf(v, dtype)
-        y_rule = half_rule(u_rule, v_rule)
-        grad_u_rule, grad_v_rule = torch.autograd.grad(
-            y_rule, (u_rule, v_rule), grad_outputs=torch.ones_like(u_rule)
-        )
-
-        grad_u_reference, grad_v_reference = self._reference_half_rule_grad(u, v)
-        torch.testing.assert_close(grad_u_rule, grad_u_reference)
-        torch.testing.assert_close(grad_v_rule, grad_v_reference)

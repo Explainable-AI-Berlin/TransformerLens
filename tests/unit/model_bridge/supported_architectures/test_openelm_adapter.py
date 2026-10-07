@@ -335,7 +335,7 @@ class TestOpenElmFFNNumericalParity:
     def test_module_activation_is_captured(self) -> None:
         module = self._FFN()
         _, bridge = self._bridge(module)
-        assert bridge._activation_fn is module.act
+        assert bridge.activation_fn is module.act
 
     def test_config_maps_activation_fn_name(self) -> None:
         """The config half: cfg.act_fn must not silently keep its 'relu'

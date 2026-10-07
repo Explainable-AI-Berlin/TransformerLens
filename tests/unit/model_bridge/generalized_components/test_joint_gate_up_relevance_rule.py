@@ -1,14 +1,11 @@
-"""Identity-/Half-rule integration on JointGateUpMLPBridge's reconstructed forward.
+"""Identity-/Half-rule on JointGateUpMLPBridge's reconstructed forward.
 
 Unlike the raw GatedMLPBridge path (opaque native forward, tested separately),
-JointGateUpMLPBridge already reconstructs its forward in Python as
+JointGateUpMLPBridge reconstructs its forward in Python as
 ``act_fn(gate_output) * up_output`` through separate gate/up LinearBridge
-submodules, so the rules attach directly at that multiplication inline, off the
-same boolean flags -- no live-submodule hook is installed here. This covers that
-the reconstructed
-forward is unaffected by an inactive rule, that both rules apply correctly
-together and independently, and that gradients match the oracle produced by the
-already-tested Identity-/Half-rule primitives directly.
+submodules, calling the HF module's own activation. The same hooks as on the opaque
+path apply there; this covers that both rules apply correctly together and
+independently, against oracles written as in the pinned RelP reference.
 """
 
 import pytest
@@ -18,8 +15,6 @@ import torch.nn.functional as F
 
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRules,
-    half_rule,
-    identity_rule,
     use_relevance_rules,
 )
 from transformer_lens.model_bridge.generalized_components.joint_gate_up_mlp import (
@@ -66,6 +61,7 @@ def _make_bridge(bias: bool = False) -> tuple[_Block, _TinyPhi3MLP]:
     bridge.add_module("out", out_bridge)
     bridge.set_original_component(hf_mlp)
     out_bridge.set_original_component(hf_mlp.down_proj)
+    bridge._register_aliases()
     return _Block(bridge), hf_mlp
 
 
@@ -75,17 +71,23 @@ def _oracle_grads(hf_mlp, gate_proj, up_proj, x, activation_active: bool, gate_a
     x_oracle = x.detach().clone().requires_grad_(True)
     gate_output = F.linear(x_oracle, gate_proj.weight, gate_proj.bias)
     up_output = F.linear(x_oracle, up_proj.weight, up_proj.bias)
-    activated = identity_rule(gate_output, F.silu) if activation_active else F.silu(gate_output)
-    gated = half_rule(activated, up_output) if gate_active else activated * up_output
+    activated = F.silu(gate_output)
+    if activation_active:
+        activated = gate_output * torch.sigmoid(gate_output).detach()
+    gated = activated * up_output
+    if gate_active:
+        gated = gated / 2 + (gated / 2).detach()
     down = hf_mlp.down_proj(gated)
     down.sum().backward()
     return x_oracle.grad.clone()
 
 
 class TestJointGateUpRelevanceRuleCapability:
-    def test_capable_of_both_kinds(self):
+    def test_both_kinds_install(self):
         block, _ = _make_bridge()
-        assert set(block.mlp._relevance_rule_kinds) == {"activation", "multiplicative_gate"}
+        rules = RelevanceRules(activation=True, multiplicative_gate=True)
+        with use_relevance_rules(block, rules) as coverage:
+            assert coverage.installed == ("mlp", "mlp")
 
 
 class TestJointGateUpRelevanceRuleForwardIdentity:

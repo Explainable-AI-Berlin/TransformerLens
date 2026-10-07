@@ -1,4 +1,4 @@
-"""Attention and LN relevance rules on one tiny offline bridge per attention family.
+"""Relevance rules on one tiny offline bridge per attention and MLP family.
 
 The attention rules rewrite ``hook_pattern`` and ``hook_v``, which is only correct if
 those HookPoints are the factors of the ``pattern @ V`` product in each family's own
@@ -10,7 +10,9 @@ composes with the rule, a native-source model (whose wrapped attention runs
 ``hook_pattern`` inside its own computation) is covered, and a delegating attention
 bridge (OPT) raises on its forward instead of silently ignoring the rule. The
 plain-LayerNorm families also exercise the LN-rule on the python-norm path, which
-the RMS-norm fixtures of ``test_relevance_lens.py`` never reach.
+the RMS-norm fixtures of ``test_relevance_lens.py`` never reach. The MLP rules are
+checked per family against an independent oracle: the model run with its own
+activation and down projection rewritten as in the pinned RelP reference.
 """
 
 from functools import lru_cache
@@ -36,7 +38,6 @@ from transformer_lens.hook_points import HookPoint
 from transformer_lens.model_bridge._relevance_rules import (
     RelevanceRules,
     RelevanceRuleUnsupportedError,
-    ln_rule,
     use_relevance_rules,
 )
 from transformer_lens.model_bridge.bridge import TransformerBridge
@@ -301,6 +302,93 @@ class TestAttentionRules:
         assert torch.equal(hooked_with_rule, hooked)
 
 
+def _assert_identity_rule_at_hook_points(bridge: TransformerBridge) -> None:
+    """Checked at the bridge's own hook points, independently of how the rule finds the
+    activation: hook_pre is the activation input and hook_post its output (times up, on
+    gated MLPs), so the Identity-rule makes grad_pre = grad_post * post / pre."""
+    mlp = bridge.blocks[0].mlp
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture(key: str):
+        def _hook(tensor: torch.Tensor, hook=None) -> None:
+            captured[key] = tensor.detach().clone()
+
+        return _hook
+
+    mlp.hook_pre.add_hook(_capture("pre"))
+    mlp.hook_post.add_hook(_capture("post"))
+    mlp.hook_pre.add_hook(_capture("grad_pre"), dir="bwd")
+    mlp.hook_post.add_hook(_capture("grad_post"), dir="bwd")
+    try:
+        with use_relevance_rules(bridge, RelevanceRules(activation=True)) as coverage:
+            assert set(coverage.installed) == {f"blocks.{i}.mlp" for i in range(N_LAYERS)}
+            bridge(TOKENS).sum().backward()
+    finally:
+        mlp.hook_pre.remove_hooks(dir="both")
+        mlp.hook_post.remove_hooks(dir="both")
+        for parameter in bridge.parameters():
+            parameter.grad = None
+
+    expected = captured["grad_post"] * captured["post"] / captured["pre"]
+    torch.testing.assert_close(captured["grad_pre"], expected, atol=1e-5, rtol=1e-4)
+
+
+def _parameter_grads(bridge: TransformerBridge) -> dict[str, torch.Tensor]:
+    """Every parameter gradient of one backward through ``bridge(TOKENS).sum()``."""
+    bridge(TOKENS).sum().backward()
+    grads = {name: p.grad.clone() for name, p in bridge.named_parameters() if p.grad is not None}
+    for parameter in bridge.parameters():
+        parameter.grad = None
+    return grads
+
+
+def _with_forward(module: torch.nn.Module, forward: Callable) -> Callable[[], None]:
+    """Override ``module``'s forward on the instance; return a function restoring it."""
+    setattr(module, "forward", forward)
+    return lambda: delattr(module, "forward")
+
+
+def _assert_grads_close(actual: dict, expected: dict) -> None:
+    assert actual.keys() == expected.keys()
+    for name, grad in actual.items():
+        torch.testing.assert_close(grad, expected[name], atol=1e-5, rtol=1e-4, msg=name)
+
+
+class TestMLPRules:
+    def test_identity_rule_passes_the_gradient_as_output_over_input(
+        self, reconstructing_bridge: TransformerBridge
+    ) -> None:
+        _assert_identity_rule_at_hook_points(reconstructing_bridge)
+
+    def test_half_rule_on_gated_mlps_matches_halved_product_oracle(
+        self, reconstructing_bridge: TransformerBridge
+    ) -> None:
+        mlps = [block.mlp for block in reconstructing_bridge.blocks]
+        gated = hasattr(mlps[0], "hook_pre_linear")
+        rules = RelevanceRules(multiplicative_gate=True)
+        with use_relevance_rules(reconstructing_bridge, rules) as coverage:
+            names = {f"blocks.{i}.mlp" for i in range(N_LAYERS)}
+            assert set(coverage.installed if gated else coverage.skipped) == names
+            rule_grads = _parameter_grads(reconstructing_bridge)
+        if not gated:
+            return
+
+        restores = []
+        for mlp in mlps:
+            # hook_post carries the gate*up product into the down projection.
+            restores.append(_with_forward(mlp.hook_post, lambda z: z / 2 + (z / 2).detach()))
+        try:
+            oracle_grads = _parameter_grads(reconstructing_bridge)
+        finally:
+            for restore in restores:
+                restore()
+        _assert_grads_close(rule_grads, oracle_grads)
+
+    def test_identity_rule_on_relu_containerless_mlp(self, opt_bridge: TransformerBridge) -> None:
+        """OPT's fc1/fc2 sit on the decoder layer, whose ReLU the rule hooks."""
+        _assert_identity_rule_at_hook_points(opt_bridge)
+
+
 class TestDelegatingAttention:
     @pytest.mark.parametrize("kind", ["attention", "attention_half"])
     def test_forward_raises_instead_of_silently_ignoring_the_rule(
@@ -372,7 +460,7 @@ class TestLayerNormPythonPath:
         self, layernorm_bridge: TransformerBridge
     ) -> None:
         """The gradient ln1 passes upstream equals a LayerNorm recompute (centering,
-        weight, bias) whose division goes through ``ln_rule``, given the gradient
+        weight, bias) whose denominator is detached, given the gradient
         ln1 actually received downstream."""
         ln1 = layernorm_bridge.blocks[0].ln1
         captured: dict[str, torch.Tensor] = {}
@@ -400,7 +488,7 @@ class TestLayerNormPythonPath:
         x_centered = x - x.mean(-1, keepdim=True)
         eps = getattr(ln1.config, "eps", 1e-5)
         denom = (x_centered.pow(2).mean(-1, keepdim=True) + eps).sqrt()
-        y = ln_rule(x_centered, denom) * layer.weight.detach()
+        y = x_centered / denom.detach() * layer.weight.detach()
         if getattr(layer, "bias", None) is not None:
             y = y + layer.bias.detach()
         (expected,) = torch.autograd.grad(y, x, grad_outputs=captured["grad_out"])

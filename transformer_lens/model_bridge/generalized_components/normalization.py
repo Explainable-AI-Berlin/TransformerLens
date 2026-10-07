@@ -1,16 +1,11 @@
 """Normalization bridge component implementation."""
 import contextlib
 import warnings
-from typing import Any, ContextManager, Dict, Optional, Tuple, cast
+from typing import Any, ContextManager, Dict, Optional, cast
 
 import torch
 
 from transformer_lens.hook_points import HookPoint
-from transformer_lens.model_bridge._relevance_rules import (
-    RelevanceRuleConflictError,
-    ln_rule,
-    ln_rule_grad,
-)
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
 )
@@ -28,83 +23,6 @@ NATIVE_PATH_EDIT_FALLBACK_WARNING = (
     "output is reconstructed from the hooked values instead of HF's native forward. "
     "Output numerics may differ from the unhooked forward at float-rounding scale."
 )
-# While the LN-rule is active, the fallbacks above would silently compose the rule
-# with the hook edit and break the bit-identical-forward guarantee, so they raise
-# instead of warning.
-RULE_ACTIVE_BWD_HOOK_CONFLICT = (
-    "Backward hooks on hook_scale/hook_normalized are incompatible with an active "
-    "LN-rule on '{name}': the rule-wrapped native forward keeps these hook points "
-    "out of its backward graph, so a backward hook here would silently never fire."
-)
-RULE_ACTIVE_EDIT_HOOK_CONFLICT = (
-    "A forward hook edited hook_scale/hook_normalized while the LN-rule is active on "
-    "'{name}': honoring the edit would require the python-norm fallback, which would "
-    "compose the rule with the edit and break the bit-identical-forward guarantee."
-)
-
-
-class _NativeLNRuleForward(torch.autograd.Function):
-    """Wrap a normalization module's own forward call in the LN-rule's VJP.
-
-    Forward returns ``component(x)`` unchanged, so the result is bit-identical to
-    the native forward by construction. Backward routes the x-path gradient
-    through the centering op ordinarily but treats ``denom`` as a constant (the
-    LN-rule), while ``weight`` and ``bias`` receive their ordinary gradient since
-    the rule only redefines how relevance reaches the input, not parameter
-    training gradients. A parameter-free norm (``weight`` is ``None``, e.g.
-    OLMo's ``OlmoLayerNorm``) is treated as a unit scale in both directions.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        x_centered: torch.Tensor,
-        denom: torch.Tensor,
-        weight: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
-        x: torch.Tensor,
-        component: torch.nn.Module,
-        offset: bool,
-        input_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        ctx.save_for_backward(x_centered, denom, weight)
-        ctx.has_bias = bias is not None
-        ctx.bias_requires_grad = bool(bias is not None and bias.requires_grad)
-        ctx.offset = offset
-        result = component(x)
-        if result.dtype != input_dtype:
-            result = result.to(input_dtype)
-        return result
-
-    @staticmethod
-    def backward(
-        ctx: Any, grad_output: torch.Tensor
-    ) -> Tuple[
-        torch.Tensor,
-        None,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        None,
-        None,
-        None,
-        None,
-    ]:
-        x_centered, denom, weight = ctx.saved_tensors
-        if weight is None:
-            w_eff: torch.Tensor | float = 1.0
-        else:
-            w_eff = (1.0 + weight) if ctx.offset else weight
-        reduce_dims = tuple(range(grad_output.dim() - 1))
-        grad_x_centered = ln_rule_grad(grad_output * w_eff, denom)
-        grad_weight = (
-            (grad_output * (x_centered / denom)).sum(dim=reduce_dims)
-            if weight is not None and weight.requires_grad
-            else None
-        )
-        grad_bias = (
-            grad_output.sum(dim=reduce_dims) if ctx.has_bias and ctx.bias_requires_grad else None
-        )
-        return grad_x_centered, None, grad_weight, grad_bias, None, None, None, None
 
 
 class NormalizationBridge(GeneralizedComponent):
@@ -142,21 +60,8 @@ class NormalizationBridge(GeneralizedComponent):
         self.hook_scale = HookPoint()
         self.use_native_layernorm_autograd = use_native_layernorm_autograd
         self._uses_rms_norm_override = uses_rms_norm
-        self._relevance_rule_active = False
-
-    # The LN-rule applies on both dispatch paths: the native-autograd path wraps the
-    # component's own forward in the rule's VJP, the python-norm path divides through
-    # ``ln_rule``. Which kind reaches an instance is decided by its mount name (block
-    # norms and ln_final: "normalization"; attn.q_norm/attn.k_norm: "qk_normalization").
-    _relevance_rule_kinds: Tuple[str, ...] = ("normalization", "qk_normalization")
-
-    def _enable_relevance_rule(self, kind: str) -> None:
-        """Activate the LN-rule on whichever dispatch path this instance takes."""
-        self._relevance_rule_active = True
-
-    def _disable_relevance_rule(self, kind: str) -> None:
-        """Deactivate the LN-rule, restoring the ordinary backward."""
-        self._relevance_rule_active = False
+        # Whether the wrapped module scales by 1 + weight; resolved on first rebuild.
+        self._weight_offset: Optional[bool] = None
 
     @property
     def uses_rms_norm(self) -> bool:
@@ -214,25 +119,23 @@ class NormalizationBridge(GeneralizedComponent):
                 hidden_states.pow(2).mean(-1, keepdim=True) + getattr(self.config, "eps", 1e-05)
             ).sqrt()
         )
-        # ln_rule's forward is this same division; its backward holds the (possibly
-        # hook-edited) scale constant.
-        normalized = (
-            ln_rule(hidden_states, scale) if self._relevance_rule_active else hidden_states / scale
-        )
-        hidden_states = self.hook_normalized(normalized)
+        hidden_states = self.hook_normalized(hidden_states / scale)
         return self._apply_weight_and_bias(hidden_states, input_dtype)
 
     def _apply_weight_and_bias(
         self, hidden_states: torch.Tensor, input_dtype: torch.dtype
     ) -> torch.Tensor:
         """Apply weight/bias in float32 before casting back (matches HF precision)."""
-        # Gemma-family RMSNorm stores weight as an offset from 1 (output uses 1 + weight).
-        weight = (
-            (1.0 + self.weight)
-            if getattr(self.config, "rmsnorm_uses_offset", False)
-            else self.weight
-        )
-        hidden_states = hidden_states * weight
+        # A parameter-free norm (OLMo's OlmoLayerNorm) has no weight: a unit scale.
+        weight = getattr(self, "weight", None)
+        if weight is not None:
+            # Gemma-family RMSNorm stores weight as an offset from 1 (output uses 1 + weight).
+            offset = self._weight_offset
+            if offset is None:
+                offset = bool(getattr(self.config, "rmsnorm_uses_offset", False))
+            if offset:
+                weight = 1.0 + weight
+            hidden_states = hidden_states * weight
         component = self.original_component
         if (
             not self.uses_rms_norm
@@ -249,6 +152,29 @@ class NormalizationBridge(GeneralizedComponent):
             result = result.contiguous()
         return result
 
+    def _resolve_weight_offset(self, normalized: torch.Tensor, native: torch.Tensor) -> None:
+        """Find once whether the wrapped module scales by ``weight`` or ``1 + weight``.
+
+        Some norms apply ``1 + weight`` without the config's ``rmsnorm_uses_offset`` flag
+        (Qwen3-Next, Nemotron's LayerNorm1P), so the rebuild keeps whichever form
+        reproduces the module's own output, and refuses if neither does.
+        """
+        if self._weight_offset is not None:
+            return
+        default = bool(getattr(self.config, "rmsnorm_uses_offset", False))
+        for offset in (default, not default):
+            self._weight_offset = offset
+            with torch.no_grad():
+                rebuilt = self._apply_weight_and_bias(normalized, native.dtype).float()
+            if (rebuilt - native.float()).norm() <= 1e-2 * native.float().norm():
+                return
+        self._weight_offset = None
+        raise RuntimeError(
+            f"{self.name}: cannot reproduce {type(self.original_component).__name__}'s output "
+            "from its hook values, so hooks editing hook_scale/hook_normalized are "
+            "unsupported on this norm."
+        )
+
     def _hf_autograd_forward_with_hooks(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass that preserves HF's autograd while firing intermediate hooks.
 
@@ -257,7 +183,9 @@ class NormalizationBridge(GeneralizedComponent):
         edits ``hook_scale`` / ``hook_normalized``, the output is reconstructed from the
         hooked values so the edit propagates; when backward hooks are attached, the whole
         computation takes the python-norm path so hook tensors stay in the autograd graph.
-        Both fallbacks warn, since their numerics differ from HF's at rounding scale.
+        Both fallbacks warn, since their numerics differ from HF's at rounding scale. An
+        edit that changes no value (a detach, as relevance rules do) keeps HF's output and
+        only takes the gradient from the reconstruction.
 
         Args:
             x: Input tensor
@@ -274,13 +202,10 @@ class NormalizationBridge(GeneralizedComponent):
             _ = self.hook_normalized(x)
             return x
         if self.hook_scale.bwd_hooks or self.hook_normalized.bwd_hooks:
-            if self._relevance_rule_active:
-                raise RelevanceRuleConflictError(
-                    RULE_ACTIVE_BWD_HOOK_CONFLICT.format(name=self.name)
-                )
             warnings.warn(NATIVE_PATH_BWD_FALLBACK_WARNING)
             return self._python_norm_forward(x)
-        has_fwd_hooks = bool(self.hook_scale.fwd_hooks or self.hook_normalized.fwd_hooks)
+        # Count hooks registered directly through torch (e.g. relevance rules), not only add_hook's.
+        has_fwd_hooks = bool(self.hook_scale._forward_hooks or self.hook_normalized._forward_hooks)
         # No hooks: skip building a graph for observation-only intermediates. With hooks,
         # keep grad so an edited value stays connected to the input.
         grad_ctx: ContextManager[Any] = (
@@ -310,7 +235,7 @@ class NormalizationBridge(GeneralizedComponent):
             # Use rsqrt for x_normalized to match HF's actual computation path
             # (LlamaRMSNorm uses x * rsqrt(variance + eps)). Keep scale as sqrt
             # for hook_scale (denominator convention used by HookedTransformer).
-            x_normalized = x_centered * inv_rms
+            x_normalized = unedited_normalized = x_centered * inv_rms
             hooked_scale = self.hook_scale(scale)
             if hooked_scale is not scale:
                 # Edited scale: recompute with the denominator convention so the edit
@@ -322,63 +247,21 @@ class NormalizationBridge(GeneralizedComponent):
         # identity is the edit signal. Note in-place mutation of the hook value without
         # returning it is NOT detected — return the tensor from the hook to edit.
         if hooked_scale is scale and hooked_normalized is x_normalized:
-            if self._relevance_rule_active:
-                return self._native_forward_with_ln_rule(x, input_dtype)
-            result = self.original_component(x)
-            if result.dtype != input_dtype:
-                result = result.to(input_dtype)
-            return result
-        if self._relevance_rule_active:
-            raise RelevanceRuleConflictError(RULE_ACTIVE_EDIT_HOOK_CONFLICT.format(name=self.name))
+            return self._native_forward(x)
+        with torch.no_grad():
+            native = self._native_forward(x)
+        self._resolve_weight_offset(unedited_normalized, native)
+        rebuilt = self._apply_weight_and_bias(hooked_normalized, input_dtype)
+        if torch.equal(hooked_scale, scale) and torch.equal(hooked_normalized, x_normalized):
+            return native + (rebuilt - rebuilt.detach())
         warnings.warn(NATIVE_PATH_EDIT_FALLBACK_WARNING)
-        return self._apply_weight_and_bias(hooked_normalized, input_dtype)
+        return rebuilt
 
-    def _native_forward_with_ln_rule(
-        self, x: torch.Tensor, input_dtype: torch.dtype
-    ) -> torch.Tensor:
-        """Call the native forward unchanged while routing its backward through the LN-rule.
-
-        Recomputes the centered numerator and denominator independently of the
-        hook-observation pass above (which may run under ``torch.no_grad()``), so
-        the recompute here stays grad-connected to ``x`` regardless of whether
-        forward hooks are attached. Autograd then flows from the returned tensor
-        back through the centering op ordinarily and, at the LN-rule Function
-        boundary, treats the denominator as a constant -- the same contract as
-        the shared ``ln_rule`` primitive, without reproducing the native kernel's
-        own forward numerics.
-        """
-        component = self.original_component
-        assert component is not None
-        x_float = x.float() if x.dtype not in (torch.float32, torch.float64) else x
-        if not self.uses_rms_norm:
-            x_centered = x_float - x_float.mean(-1, keepdim=True)
-        else:
-            x_centered = x_float
-        eps_tensor = getattr(component, "eps", None)
-        if eps_tensor is None:
-            eps_tensor = getattr(component, "variance_epsilon", None)
-        if eps_tensor is None:
-            eps_value: float | torch.Tensor = getattr(self.config, "eps", 1e-05)
-        else:
-            eps_value = eps_tensor
-        variance = x_centered.pow(2).mean(-1, keepdim=True)
-        denom = (
-            (variance + eps_value).sqrt()
-            if isinstance(eps_value, torch.Tensor)
-            else (variance + float(eps_value)).sqrt()
-        )
-        # A parameter-free norm (OLMo's OlmoLayerNorm) exposes no usable weight;
-        # pass None so the rule treats the scale as 1 in both forward and backward.
-        try:
-            weight: Optional[torch.Tensor] = cast(torch.Tensor, self.weight)
-        except AttributeError:
-            weight = None
-        bias = getattr(component, "bias", None) if not self.uses_rms_norm else None
-        offset = bool(getattr(self.config, "rmsnorm_uses_offset", False))
-        result: torch.Tensor = _NativeLNRuleForward.apply(
-            x_centered, denom, weight, bias, x, component, offset, input_dtype
-        )
-        return result
+    def _native_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """The wrapped module's own output, in the input's dtype."""
+        assert self.original_component is not None
+        result = self.original_component(x)
+        return result if result.dtype == x.dtype else result.to(x.dtype)
 
 
 class LayerNormPreBridge(NormalizationBridge):

@@ -6,7 +6,7 @@ This module contains the bridge component for Mixture of Experts layers.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 from torch import nn
@@ -17,6 +17,7 @@ from transformer_lens.model_bridge.generalized_components.base import (
 )
 from transformer_lens.model_bridge.generalized_components.linear import LinearBridge
 from transformer_lens.model_bridge.generalized_components.mlp import (
+    find_activation_fn,
     normalize_mlp_weight,
     weight_layout_in_out,
 )
@@ -219,6 +220,11 @@ class MoEBridge(GeneralizedComponent):
         # Alias so code migrated from HT finds them under the HT name.
         self._router_hook_aliases = self._build_router_hook_aliases(submodules or {})
         self.hook_aliases = {**self.hook_aliases, **self._router_hook_aliases}
+
+    @property
+    def activation_fn(self) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """A dense layer's activation; sparse blocks keep theirs inside the experts."""
+        return find_activation_fn(self.original_component)
 
     @staticmethod
     def _build_router_hook_aliases(

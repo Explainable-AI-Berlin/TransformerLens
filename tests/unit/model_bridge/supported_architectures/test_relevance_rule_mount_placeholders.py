@@ -2,7 +2,7 @@
 or sandwich-norm placeholders instead of a rule-capable ln1/ln2.
 
 ``use_relevance_rules`` targets the "normalization" rule kind only at the block-norm
-mount names such as ln1/ln2, and "qk_normalization" only at q_norm/k_norm (see ``_CANONICAL_MOUNTS`` in ``transformer_lens.model_bridge._relevance_rules``),
+mount names such as ln1/ln2, and "qk_normalization" only at q_norm/k_norm (see ``_RULES`` in ``transformer_lens.model_bridge._relevance_rules``),
 matched on the last segment of a live module's registered name. These tests inspect
 each adapter's declared ``component_mapping`` directly (no HF weights, no live module
 wiring) to lock in the structural facts that make the mechanism's "not applicable"
@@ -21,12 +21,14 @@ working forward-capable module tree per adapter:
   key, not the wrapped module's own name, is what the canonical-mount check reads.
 - Qwen3: the positive case for "qk_normalization" -- its q_norm/k_norm are real
   ``NormalizationBridge`` instances.
+
+A placeholder exposes no ``hook_scale``, so the LN-rule reports its mount skipped.
 """
 
 from typing import Any
 
 from tests.unit.model_bridge.supported_architectures.helpers import make_bridge_cfg
-from transformer_lens.model_bridge._relevance_rules import _RelevanceRuleCapable
+from transformer_lens.model_bridge._relevance_rules import _RULES
 from transformer_lens.model_bridge.generalized_components import NormalizationBridge
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
@@ -70,7 +72,7 @@ class TestGemma3nPlaceholders:
             component = attn_submodules[key]
             assert type(component) is GeneralizedComponent
             assert not isinstance(component, NormalizationBridge)
-            assert not isinstance(component, _RelevanceRuleCapable)
+            assert _RULES["normalization"].support(component) is None
 
 
 class TestGemma4Placeholders:
@@ -90,7 +92,7 @@ class TestGemma4Placeholders:
             component = block_submodules[key]
             assert type(component) is GeneralizedComponent
             assert not isinstance(component, NormalizationBridge)
-            assert not isinstance(component, _RelevanceRuleCapable)
+            assert _RULES["normalization"].support(component) is None
 
     def test_qkv_norm_placeholders_are_not_keyed_ln1_or_ln2(self):
         block_submodules = _block_submodules(self._adapter())
@@ -99,7 +101,7 @@ class TestGemma4Placeholders:
             assert key not in ("ln1", "ln2")
             component = attn_submodules[key]
             assert type(component) is GeneralizedComponent
-            assert not isinstance(component, _RelevanceRuleCapable)
+            assert _RULES["normalization"].support(component) is None
 
 
 class TestStableLmPlaceholders:
@@ -114,15 +116,13 @@ class TestStableLmPlaceholders:
         for key in ("ln1", "ln2"):
             component = block_submodules[key]
             assert isinstance(component, NormalizationBridge)
-            assert isinstance(component, _RelevanceRuleCapable)
-            assert "normalization" in component._relevance_rule_kinds
+            assert _RULES["normalization"].support(component)
 
     def test_per_head_norms_are_keyed_q_norm_k_norm_not_ln1_ln2(self):
         """The wrapped HF module is named q_layernorm/k_layernorm, but the mount
         KEY the canonical-mount check reads is q_norm/k_norm -- distinct either
         way from ln1/ln2, so these stay invisible to the "normalization" rule
-        regardless of which naming convention the underlying HF module uses. Being
-        plain placeholders, a "qk_normalization" request reports them skipped."""
+        regardless of which naming convention the underlying HF module uses."""
         block_submodules = _block_submodules(self._adapter())
         attn_submodules = _attn_submodules(block_submodules, "attn")
         assert attn_submodules["q_norm"].name == "q_layernorm"
@@ -131,15 +131,14 @@ class TestStableLmPlaceholders:
             component = attn_submodules[key]
             assert key not in ("ln1", "ln2")
             assert type(component) is GeneralizedComponent
-            assert not isinstance(component, _RelevanceRuleCapable)
+            assert _RULES["normalization"].support(component) is None
 
 
 class TestQwen3QkNormMounts:
-    def test_q_norm_and_k_norm_are_rule_capable_under_qk_normalization(self):
+    def test_q_norm_and_k_norm_are_ln_rule_targets(self):
         cfg = make_bridge_cfg("Qwen3ForCausalLM", n_key_value_heads=2, d_head=8)
         attn_submodules = _attn_submodules(_block_submodules(Qwen3ArchitectureAdapter(cfg)), "attn")
         for key in ("q_norm", "k_norm"):
             component = attn_submodules[key]
             assert isinstance(component, NormalizationBridge)
-            assert isinstance(component, _RelevanceRuleCapable)
-            assert "qk_normalization" in component._relevance_rule_kinds
+            assert _RULES["qk_normalization"].support(component)
