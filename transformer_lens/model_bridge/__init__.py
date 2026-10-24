@@ -23,6 +23,7 @@ from transformer_lens.model_bridge.generalized_components import (
     MoEBridge,
     UnembeddingBridge,
 )
+from transformer_lens.model_bridge.lrp import LRPRules
 from transformer_lens.model_bridge.types import (
     ComponentMapping,
     HookFunction,
@@ -49,6 +50,7 @@ __all__ = [
     "MLPBridge",
     "MoEBridge",
     "UnembeddingBridge",
+    "LRPRules",
     "replace_remote_component",
     "set_original_components",
     "setup_blocks_bridge",

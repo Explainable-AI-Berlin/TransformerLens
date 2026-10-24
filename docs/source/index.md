@@ -65,6 +65,7 @@ content/jacobian_lens_fitting
 generated/demos/Jacobian_Lens_Decomposition_Demo
 generated/demos/Jacobian_Lens_Coordinate_Patch_Benchmark_Demo
 content/backward_lens
+content/lrp_rules
 content/debugging_numerical_divergence
 content/sparse_probing
 generated/demos/Main_Demo

@@ -68,6 +68,7 @@ from transformer_lens.model_bridge.generalized_components.moe import (
     has_batched_experts,
 )
 from transformer_lens.model_bridge.get_params_util import get_bridge_params
+from transformer_lens.model_bridge.lrp.mixin import LRPMixin
 from transformer_lens.utilities.activation_functions import softcap_enabled
 from transformer_lens.utilities.devices import move_to_and_update_config
 from transformer_lens.utilities.quantization import require_readable_weight
@@ -112,7 +113,7 @@ def _storage_group_keys(state_dict: dict[str, torch.Tensor]) -> set[str]:
     return {key for keys in by_storage.values() if len(keys) > 1 for key in keys}
 
 
-class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
+class TransformerBridge(BridgeCore, HookIntrospectionMixin, LRPMixin, nn.Module):
     """Torch-backed bridge: HF, vLLM-via-torch, anything that wraps an ``nn.Module``.
 
     Provides a standardized interface to access components of a transformer

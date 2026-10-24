@@ -20,6 +20,7 @@ the [4.0 migration guide](migrating_to_v4.md) for existing `HookedTransformer` c
 | How can I read or edit residuals through a fitted transport map? | **Jacobian Lens** | A matching lens artifact and model, plus prompts or activations → vocabulary readouts, decompositions, or interventions. | Readouts under the fitted map; causal effects require running and measuring an intervention. |
 | How much do two subspaces overlap? | **Projection Kernel** | Two subspace bases, or Bridge attention-head weight spaces → overlap scores and principal-angle information. | Shared geometric support, independent of the choice of basis within each subspace. |
 | What are a head's QK/OV singular directions? | **SVD Circuits: head decomposition** | Model weights and a layer/head index → singular values, vectors, and degeneracy reports. | The linear structure of the head's weight maps. |
+| Which input tokens does an output depend on, under a conservative relevance decomposition? | **LRP rules** | A prompt and a scalar target (the loss or a logit difference) → activation-times-gradient relevances at every hook point. | A layer-wise relevance propagation attribution under the selected rules; see the [LRP guide](lrp_rules.md). |
 
 These are starting points, not a required pipeline. For example, a weight-space
 comparison can motivate a patching experiment, but a large overlap score alone does
@@ -40,6 +41,7 @@ available hooks, and the meaning of the selected tensor axes.
 | Jacobian Lens | Requires a fresh, causal decoder-only Bridge with raw HF weights, without compatibility mode or weight processing. Validate the lens against the model. Fitting additionally requires all modules in evaluation mode. | Loading an existing artifact avoids fitting. The ordinary fitting estimator uses one forward and `ceil(d_model / dim_batch)` backwards per prompt; larger batches increase memory. |
 | Projection Kernel | The numerical API accepts finite, real floating-point matrices via orthonormal bases. The attention-head wrapper requires Bridge weights with compatible dimensions and ranks. | Basis extraction uses SVD. All-head comparisons allocate basis stacks and a pairwise score grid; they can be large despite requiring no forward pass. |
 | SVD head decomposition | Uses Bridge per-block weight accessors; requires accessible, compatible `W_Q`, `W_K`, `W_V`, and `W_O` for the selected head. No compatibility mode or activation cache is needed. | Factored QK/OV SVD, with rank bounded by `d_head`; the dense `d_model × d_model` product is not materialized. |
+| LRP rules | Targets TransformerBridge with raw weights; compatibility mode changes the coordinate system and weight processing disables `identity-rule-act`. `patch_lrp` validates every rule per block; check `get_lrp_coverage()` before trusting a rule list on a new architecture. | One forward and one backward per prompt; the permanent hooks stay installed until `unpatch_lrp`. |
 
 **Compatibility mode is a method-specific choice.** DLA needs it on Bridge, whereas
 Jacobian Lens requires raw weights. Use separately loaded models when comparing these
