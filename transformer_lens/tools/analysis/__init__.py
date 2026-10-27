@@ -33,6 +33,10 @@ Tools:
       the ``logit_readout`` kernel that reads any ``d_model`` vector through the
       real final norm, unembedding and adapter output transform, chunked over
       the vocabulary with target ranks, top-k and vocabulary subsets.
+    - lrp: LRP rules (LN, AH, Half, Identity) for backward passes: a context manager
+      under which gradients become layer-wise relevance propagation gradients, so
+      activation times gradient at any hook point is relevance and attribution
+      patching becomes relevance patching (RelP). Forward outputs are unchanged.
     - projection_kernel: Basis-invariant subspace overlap and TransformerBridge
       attention-head OQ/OK/OV affinity.
     - sparse_probing: Leakage-safe k-sparse binary probes over supplied
@@ -51,6 +55,7 @@ from transformer_lens.tools.analysis.attribution_patching import (
     FaithfulnessConfig,
     Node,
     attribution_patch,
+    cache_activation_and_gradient,
     faithfulness,
 )
 from transformer_lens.tools.analysis.direct_logit_attribution import (
@@ -82,6 +87,7 @@ from transformer_lens.tools.analysis.jacobian_lens_decomposition import (
     get_sparse_decomposition,
 )
 from transformer_lens.tools.analysis.logit_lens import logit_lens, logit_readout
+from transformer_lens.tools.analysis.lrp import lrp_rules
 from transformer_lens.tools.analysis.projection_kernel import (
     SubspaceBasis,
     attention_head_subspace_affinity,
@@ -109,6 +115,7 @@ __all__ = [
     "arbitrary_targets",
     "attention_head_subspace_affinity",
     "attribution_patch",
+    "cache_activation_and_gradient",
     "collect_activations",
     "direct_logit_attribution",
     "faithfulness",
@@ -120,6 +127,7 @@ __all__ = [
     "intervened_logits",
     "logit_lens",
     "logit_readout",
+    "lrp_rules",
     "mean_difference_basis",
     "neuron_basis",
     "orthonormal_subspace",

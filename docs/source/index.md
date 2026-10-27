@@ -67,6 +67,7 @@ generated/demos/Jacobian_Lens_Coordinate_Patch_Benchmark_Demo
 content/debugging_numerical_divergence
 content/sparse_probing
 content/interchange_interventions
+content/lrp
 generated/demos/SVD_Circuits_Demo
 generated/demos/SwiGLU_Gate_Sign_Demo
 generated/demos/Backward_Lens_Demo
