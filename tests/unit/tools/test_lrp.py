@@ -691,6 +691,14 @@ def test_invalid_rules_raise(rules: tuple, match: str) -> None:
             pass
 
 
+def test_training_mode_raises() -> None:
+    model = _bridge("gpt2")
+    model.blocks[0].attn.original_component.train()
+    with pytest.raises(ValueError, match="evaluation mode"):
+        with lrp_rules(model):
+            pass
+
+
 def test_duplicate_rules_apply_once() -> None:
     model = _bridge("llama")
     _, once, _ = _input_grad(model, ["half", "attn_half"])
@@ -721,7 +729,7 @@ def test_only_components_a_requested_rule_needs_are_checked() -> None:
     _input_grad(model, ["ln"])
     with pytest.raises(NotImplementedError, match="in-place"):
         gpt2 = _bridge("gpt2")
-        gpt2.blocks[0].mlp.original_component.act = nn.ReLU(inplace=True)
+        gpt2.blocks[0].mlp.original_component.act = nn.ReLU(inplace=True).eval()
         with lrp_rules(gpt2):
             pass
 
@@ -951,7 +959,7 @@ def _llava() -> TransformerBridge:
     hf_model = transformers.LlavaForConditionalGeneration(config).double().eval()
     return build_bridge_from_module(
         hf_model, "LlavaForConditionalGeneration", hf_config=config, tokenizer=None, device="cpu"
-    )
+    ).eval()
 
 
 def test_vision_language_model() -> None:
@@ -1005,7 +1013,7 @@ def test_attention_projection_bypass_raises() -> None:
     model = _bridge("gptj")
     hf_attn = model.blocks[0].attn.original_component
     weight = hf_attn.k_proj.original_component.weight
-    bypass = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
+    bypass = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype).eval()
     bypass.weight = weight  # Same projection, but not the bridged module.
     setattr(hf_attn, "k_proj", bypass)
     for rules in (["ah"], ["attn_half"]):

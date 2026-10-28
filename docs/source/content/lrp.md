@@ -96,7 +96,8 @@ runs one forward and backward for any scalar metric and returns activations and 
 the hook points' canonical shapes (per head at `hook_z`, `hook_q`, ...):
 
 ```python
-from transformer_lens.tools.analysis import cache_activation_and_gradient, lrp_rules
+from transformer_lens.tools.analysis import lrp_rules
+from transformer_lens.tools.analysis.attribution_patching import cache_activation_and_gradient
 
 def metric(logits):
     return logits[0, -1, paris]
@@ -211,7 +212,8 @@ the runtime checks cannot see.
 | A forward hook edits `hook_scale` or `hook_normalized` of a native-path norm | `RuntimeError`: the bridge then rebuilds the norm output and the LN-rule does not apply. |
 
 Each rule checks on every forward that needs gradients that it ran where it applies, so a
-bypass raises instead of giving ordinary gradients.
+bypass raises instead of giving ordinary gradients. Run the model and all submodules in
+evaluation mode; `lrp_rules` raises `ValueError` on entry otherwise.
 
 ## Conservation and interpretation
 

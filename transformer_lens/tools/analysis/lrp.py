@@ -66,6 +66,7 @@ from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
 )
 from transformer_lens.model_bridge.generalized_components.t5_block import T5BlockBridge
+from transformer_lens.tools.analysis._model_state import require_eval_mode
 from transformer_lens.utilities.activation_functions import softcap_enabled
 
 if TYPE_CHECKING:
@@ -88,6 +89,8 @@ _HF_ACTIVATIONS = set(
 )
 _ACTIVATION_PATHS: tuple[str, ...] = ("act_fn", "act", "activation_fn", "activation", "gelu_impl")
 _ACTIVATION_PATHS += ("intermediate.intermediate_act_fn",)  # BERT, RoBERTa.
+# Modules in torch's activation module that are not elementwise activations.
+_NOT_ACTIVATIONS = (nn.Softmax, nn.Softmin, nn.LogSoftmax, nn.Softmax2d, nn.MultiheadAttention)
 _CACHE_KWARGS = ("past_key_values", "past_key_value", "layer_past")
 _BLOCKS = (BlockBridge, T5BlockBridge)
 # Block parts whose nonlinearities the rules cover; anything else is an unsupported mixer.
@@ -189,13 +192,8 @@ def _unwrap(module: Any) -> Any:
 
 
 def _is_activation(module: nn.Module) -> bool:
-    # Softmax and nn.MultiheadAttention live in torch's activation module too.
-    kind = type(module)
-    return (
-        kind.__module__ in ("transformers.activations", nn.ReLU.__module__)
-        and "Softm" not in kind.__name__
-        and not isinstance(module, nn.MultiheadAttention)
-    )
+    torch_or_hf = type(module).__module__ in ("transformers.activations", nn.ReLU.__module__)
+    return torch_or_hf and not isinstance(module, _NOT_ACTIVATIONS)
 
 
 def _activation(owner: nn.Module) -> Optional[nn.Module]:
@@ -274,7 +272,9 @@ class _Installer:
         self.keys = itertools.count()
 
     def hook(self, module: nn.Module, fn: Callable[..., Any]) -> None:
-        # Prepend, so user hooks on the same point see (and cache) the rule's output.
+        # Raw torch hooks, not HookPoint.add_hook: components change their forward when a hook
+        # point has hooks (NormalizationBridge leaves HF's native norm), and reset_hooks() would
+        # drop them. Prepend, so user hooks on the same point see (and cache) the rule's output.
         self.handles.append(module.register_forward_hook(fn, prepend=True))
 
     def site(
@@ -290,21 +290,22 @@ class _Installer:
         if (id(owner), rule) not in self.required:
             required = self.required[(id(owner), rule)] = set()
             name = _name(owner)
+            input_needs_grad = False
 
             def reset(_: nn.Module, __: Any, x: Any) -> None:
-                needs_grad[0] = _needs_grad(x)
+                nonlocal input_needs_grad
+                input_needs_grad = _needs_grad(x)
                 self.fired.difference_update(required)
 
             def check(_: nn.Module, __: Any, y: Any) -> None:
                 # A frozen input with trainable parameters still needs the rules.
-                cut = needs_grad[0] and not _needs_grad(y)
+                cut = input_needs_grad and not _needs_grad(y)
                 if cut or (_needs_grad(y) and not required <= self.fired):
                     raise RuntimeError(
                         f"The {rule!r} LRP rule did not run in {name} on this forward path, "
                         f"so its gradients would be wrong.{_BYPASS_HINTS.get(rule, '')}"
                     )
 
-            needs_grad = [False]
             self.hook(owner.hook_in, reset)
             self.hook(owner.hook_out, check)
         self.required[(id(owner), rule)].add(key)
@@ -559,7 +560,8 @@ class _Installer:
 
         def on_output(_: nn.Module, __: Any, out: Any) -> None:
             y = getattr(out, "logits", None)
-            if (rewired := rewire(y, getattr(out, "loss", None))) is not y:
+            rewired = rewire(y, getattr(out, "loss", None))
+            if rewired is not y:
                 out.logits = rewired
 
         self.handles.append(consumer.register_forward_pre_hook(lambda *_: raw.clear()))
@@ -667,7 +669,7 @@ def lrp_rules(
         A mapping from each rule to the components it was installed on.
 
     Raises:
-        ValueError: Empty, unknown or mutually exclusive rules.
+        ValueError: Empty, unknown or mutually exclusive rules, or a module in training mode.
         NotImplementedError: A rule meets a component it does not support (the message names
             the rules to drop).
         RuntimeError: Nested use, or a forward that needs gradients bypassed a rule.
@@ -685,6 +687,7 @@ def lrp_rules(
     keys = {id(model), id(model.original_model)}
     if keys & _ACTIVE:
         raise RuntimeError("lrp_rules is already active on this model; nesting would stack rules.")
+    require_eval_mode(model, operation="lrp_rules")
     unsupported = _unsupported(model, requested)
     if unsupported:
         raise NotImplementedError(f"LRP rules {requested} cannot cover: {'; '.join(unsupported)}")
@@ -694,11 +697,14 @@ def lrp_rules(
     try:
         for module in model.modules():
             for rule in requested:
-                install = {"ln": inst.ln, "identity": inst.identity}.get(rule)
-                if install is not None:
-                    install(module)
+                if rule == "ln":
+                    inst.ln(module)
+                elif rule == "identity":
+                    inst.identity(module)
+                elif rule in _ATTENTION_SCALES:
+                    inst.attention(module, rule)
                 else:
-                    (inst.attention if rule in _ATTENTION_SCALES else inst.products)(module, rule)
+                    inst.products(module, rule)
         if "identity" in requested and softcap_enabled(
             getattr(model.cfg, "output_logits_soft_cap", None)
         ):

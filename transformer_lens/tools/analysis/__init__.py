@@ -55,7 +55,6 @@ from transformer_lens.tools.analysis.attribution_patching import (
     FaithfulnessConfig,
     Node,
     attribution_patch,
-    cache_activation_and_gradient,
     faithfulness,
 )
 from transformer_lens.tools.analysis.direct_logit_attribution import (
@@ -115,7 +114,6 @@ __all__ = [
     "arbitrary_targets",
     "attention_head_subspace_affinity",
     "attribution_patch",
-    "cache_activation_and_gradient",
     "collect_activations",
     "direct_logit_attribution",
     "faithfulness",
