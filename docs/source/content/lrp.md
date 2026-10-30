@@ -205,7 +205,8 @@ the runtime checks cannot see.
 | KV-cache decoding (`generate`, `past_key_values`) | Supported. Self-attention projects K and V of every new token. HF-run cross-attention (T5) may skip its k and v projections only when the same cache object got K and V through the rule earlier in the block; otherwise it raises. A cache filled outside the block keeps ordinary gradients for the cached positions. |
 | SSM, linear-attention, RWKV and gated-convolution mixers | Hybrid stacks (Jamba, Falcon-H1, Bamba, LFM2, Qwen3-Next): `NotImplementedError` for the attention rules, `"half"` and `"gate"`; the LN- and Identity-rule alone still work. Pure SSM models (Mamba, Mamba-2, opaque blocks): every rule set raises. |
 | Final-logit softcap (Gemma 2, `output_logits_soft_cap`) | Identity-rule, applied to the logits that the HF model returns. A loss that HF computes inside the model (`original_model(..., labels=...)`) or a tuple output (`return_dict=False`) raises `RuntimeError`; compute the loss from the logits, as the bridge's `return_type="loss"` does. |
-| Gated norms; opaque and AltUp blocks | `NotImplementedError` on entry (gated norms: for the LN- and Half-rule). |
+| Gated norms; opaque and AltUp blocks | `NotImplementedError` on entry (gated norms: for the LN-, Half- and gate rule). |
+| Native-source bridges (`TransformerBridge.boot_native`) | Both attention rules, through the `pattern_fn` seam. The MLP calls its activation as a function, so the Identity-rule raises `NotImplementedError` on entry; use `rules=["ln", "ah"]` or `["ln", "attn_half"]`. |
 | Activations not known to be elementwise with `f(0) = 0` (sigmoid, softplus, GLU, unknown classes), or in-place activations | `NotImplementedError` for the Identity-rule. |
 | A LayerNorm or `*RMSNorm` that the adapter wraps as a plain component (DeepSeek `q_a_layernorm`) | LN-rule on the HF module. |
 | Any other norm or activation outside every covered component runs | `RuntimeError` on the forward, naming the rules to drop. |
@@ -213,7 +214,22 @@ the runtime checks cannot see.
 
 Each rule checks on every forward that needs gradients that it ran where it applies, so a
 bypass raises instead of giving ordinary gradients. Run the model and all submodules in
-evaluation mode; `lrp_rules` raises `ValueError` on entry otherwise.
+evaluation mode; `lrp_rules` raises `LRPConfigError` (a `ValueError`) on entry otherwise.
+
+### Errors and warnings
+
+Every error is an `LRPError` and also the builtin named above, so existing `except ValueError`
+code keeps working. Each message names the component and the rules to drop.
+
+| Class | Builtin | Raised for |
+|---|---|---|
+| `LRPConfigError` | `ValueError` | An empty or unknown rule, a string instead of a list (`rules="ln"`; pass `["ln"]`), both rules of a conflicting pair (`"ah"` and `"attn_half"`, `"half"` and `"gate"`), or a module in training mode. On entry. |
+| `LRPUnsupportedError` | `NotImplementedError` | A requested rule meets a component it cannot cover. On entry. |
+| `LRPRuntimeError` | `RuntimeError` | A forward that needs gradients bypassed a rule, or `lrp_rules` is already active on the model. |
+
+`LRPWarning` (a `UserWarning`) flags a rule of a custom set that finds nothing to act on
+(`["ln", "half"]` on GPT-2) and the LN-rule on float16 models. The presets above never warn
+about a missing operation (CP-LRP's `"gate"` on GPT-2).
 
 ## Conservation and interpretation
 

@@ -1,11 +1,4 @@
-"""Relevance conservation under the LRP rules, beyond the input-level check in test_lrp.py.
-
-Layer-wise: on a bias-free model the residual stream carries the explained logit at every
-block boundary, so errors that cancel between layers cannot hide behind a correct input
-sum. Per component: each norm, attention and MLP passes on exactly the relevance it
-receives. With biases: the input relevance plus the relevance each bias absorbs (bias times
-its gradient) is the logit, so conservation is checked on unmodified models too.
-"""
+"""Relevance conservation per block boundary, per component and with biases."""
 
 from __future__ import annotations
 
@@ -34,11 +27,7 @@ _BIASED = ["gpt2", "opt", "neox", "gptj"]
 def _relevance_at(
     model: TransformerBridge, rules: Any, names: list[str], fwd_hooks: tuple = ()
 ) -> tuple[list[Optional[torch.Tensor]], torch.Tensor]:
-    """Relevance (activation x gradient, summed) at each hook point, and the target logit.
-
-    ``fwd_hooks`` run first, so a hook that replaces the tensor is what gets measured. A hook
-    point whose tensor does not reach the logit (a mirrored, observation-only point) is None.
-    """
+    """Relevance at each hook point (None if off the graph) and the logit; fwd_hooks run first."""
     store: dict[str, torch.Tensor] = {}
     keep = [(name, lambda t, hook: store.update({hook.name: t})) for name in names]
     with lrp_rules(model, rules), model.hooks(fwd_hooks=[*fwd_hooks, *keep]):

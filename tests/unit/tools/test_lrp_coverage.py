@@ -1,9 +1,4 @@
-"""Cases the previous relevance-rule suite covered that test_lrp.py does not.
-
-Rebuilt attention families (Bloom, MPT with ALiBi, CodeGen), native-source attention through
-the ``pattern_fn`` seam, the rule primitives against closed forms, ordinary parameter
-gradients under the LN-rule, and user hooks on python-path norm internals.
-"""
+"""Cases from the previous relevance-rule suite that test_lrp.py does not cover."""
 
 from __future__ import annotations
 
@@ -33,8 +28,7 @@ from transformer_lens.model_bridge.sources._bridge_builder import (
 from transformer_lens.tools.analysis import lrp_rules
 from transformer_lens.tools.analysis.lrp import _FrozenScaleNorm, _ratio, _Rewire
 
-# Rebuilt attention the previous suite exercised and test_lrp.py does not: ALiBi (Bloom, MPT)
-# and CodeGen's partial rotary over a fused qkv.
+# Rebuilt attention not in test_lrp.py: ALiBi (Bloom, MPT) and CodeGen's partial rotary.
 _FAMILIES: dict[str, tuple[str, Callable[[], Any]]] = {
     "bloom": (
         "BloomForCausalLM",
@@ -102,8 +96,7 @@ def test_rebuilt_attention_families_match_attention_oracles(arch: str) -> None:
     detach = _per_layer(model, "hook_pattern", lambda t, hook: t.detach())
     _, oracle, _ = _input_grad(model, "plain", fwd_hooks=detach)
     torch.testing.assert_close(grad, oracle, rtol=0, atol=1e-12)
-    # AttnLRP: the pattern gets 1/4 of its gradient (half for QK^T, half for pattern @ V),
-    # the values 1/2. The rule itself scales below hook_attn_scores and hook_z instead.
+    # AttnLRP: pattern gradient / 4 (QK^T and pattern @ V), values / 2.
     _, grad, _ = _input_grad(model, ["attn_half"])
     quarter = _per_layer(model, "hook_pattern", lambda t, hook: _divide_gradient(t, 4))
     half = _per_layer(model, "hook_v", lambda t, hook: _divide_gradient(t, 2))
@@ -129,8 +122,7 @@ def _native() -> TransformerBridge:
 
 
 def test_native_source_attention_gets_the_rules_through_its_pattern_seam() -> None:
-    # The base AttentionBridge hands hook_pattern to a native attention as pattern_fn, which
-    # applies it before its own pattern @ V.
+    # Native attention applies hook_pattern (as pattern_fn) before its own pattern @ V.
     model = _native()
     _, grad, _ = _input_grad(model, ["ah"])
     detach = _per_layer(model, "hook_pattern", lambda t, hook: t.detach())
@@ -145,7 +137,7 @@ def test_native_source_attention_gets_the_rules_through_its_pattern_seam() -> No
     with pytest.raises(NotImplementedError, match="no activation module.*without 'identity'"):
         with lrp_rules(model):
             pass
-    with lrp_rules(model, ["ln", "ah", "half"]) as sites:
+    with lrp_rules(model, ["ln", "ah"]) as sites:
         assert len(sites["ah"]) == 2 and sites["ln"]
 
 
@@ -261,8 +253,7 @@ def test_ln_rule_holds_an_edited_python_path_scale_constant() -> None:
 
 @pytest.mark.parametrize("arch", ["gpt2", "llama"])
 def test_backward_hooks_on_norm_internals_leave_the_rule_in_place(arch: str) -> None:
-    # On llama's native path, backward hooks there make the bridge fall back to its python
-    # norm; the LN-rule follows. hook_scale reports its own gradient, which stops there.
+    # On llama these hooks make the norm fall back to the python path; the LN-rule follows.
     model = _bridge(arch)
     _, expected, _ = _input_grad(model, ["ln"])
     seen: dict[str, torch.Tensor] = {}
@@ -274,6 +265,5 @@ def test_backward_hooks_on_norm_internals_leave_the_rule_in_place(arch: str) -> 
         ):
             _, grad, _ = _input_grad(model, ["ln"])
     assert set(seen) == set(points) and seen[points[0]].abs().sum() > 0
-    # The python fallback differs from HF's float32 RMSNorm at rounding scale: without any
-    # rule, the plain input gradient moves by the same ~7e-8 when it falls back.
+    # The fallback moves plain gradients by the same ~7e-8 (HF RMSNorm runs in float32).
     torch.testing.assert_close(grad, expected, rtol=1e-6, atol=2e-7)

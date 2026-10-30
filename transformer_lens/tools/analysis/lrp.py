@@ -33,6 +33,8 @@ Assumptions the runtime checks cannot see (each has an oracle test):
 from __future__ import annotations
 
 import itertools
+import sys
+import warnings
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -76,7 +78,44 @@ LRPRule = Literal["ln", "ah", "attn_half", "half", "gate", "identity"]
 ALL_RULES: tuple[LRPRule, ...] = ("ln", "ah", "attn_half", "half", "gate", "identity")
 DEFAULT_RULES: tuple[LRPRule, ...] = ("ln", "ah", "half", "identity")
 _EXCLUSIVE = ({"ah", "attn_half"}, {"half", "gate"})
+# The lrp.md presets fit any model, so a rule of theirs that finds nothing is not warned about.
+_PRESETS: tuple[frozenset[LRPRule], ...] = (
+    frozenset(DEFAULT_RULES),
+    frozenset({"ln", "identity", "half"}),
+    frozenset({"ln", "attn_half", "half", "identity"}),
+    frozenset({"ln", "ah", "gate", "identity"}),
+)
+# What each rule acts on, for messages.
+_TARGETS: dict[LRPRule, str] = {
+    "ln": "normalization layers",
+    "ah": "attention layers",
+    "attn_half": "attention layers",
+    "half": "gated products (gated MLPs, MoE experts, gated attention outputs)",
+    "gate": "gated products (gated MLPs, MoE experts, gated attention outputs)",
+    "identity": "elementwise activations",
+}
 Scale = Union[float, torch.Tensor]
+
+
+class LRPError(Exception):
+    """Base class of the errors :func:`lrp_rules` raises."""
+
+
+class LRPConfigError(LRPError, ValueError):
+    """The requested rules are empty, unknown or conflicting, or a module is in training mode."""
+
+
+class LRPUnsupportedError(LRPError, NotImplementedError):
+    """A requested rule meets a component it cannot cover; the message names the rules to drop."""
+
+
+class LRPRuntimeError(LRPError, RuntimeError):
+    """A forward that needs gradients bypassed a rule, or ``lrp_rules`` is already active."""
+
+
+class LRPWarning(UserWarning):
+    """A requested rule has no effect on this model, or may overflow in its dtype."""
+
 
 # Elementwise with f(0) = 0 (xIELU: up to its eps of 1e-6), so f(x) / x is a well-defined
 # relevance multiplier. The Identity-rule drops the parameter gradients of PReLU and xIELU.
@@ -234,7 +273,7 @@ def _experts(module: nn.Module, rule: str) -> Optional[nn.Module]:
     if getattr(apply_gate, "__name__", "") != "_default_apply_gate" or not getattr(
         _unwrap(experts), "has_gate", False
     ):
-        raise NotImplementedError(
+        raise LRPUnsupportedError(
             f"{rule!r} on {_name(module)}: {type(hf).__name__} does not use the standard "
             f"gated HF experts module. {_DROP_ACTIVATION_RULES}"
         )
@@ -301,9 +340,10 @@ class _Installer:
                 # A frozen input with trainable parameters still needs the rules.
                 cut = input_needs_grad and not _needs_grad(y)
                 if cut or (_needs_grad(y) and not required <= self.fired):
-                    raise RuntimeError(
+                    raise LRPRuntimeError(
                         f"The {rule!r} LRP rule did not run in {name} on this forward path, "
-                        f"so its gradients would be wrong.{_BYPASS_HINTS.get(rule, '')}"
+                        "so its gradients would be wrong."
+                        + _BYPASS_HINTS.get(rule, f" Use rules without {rule!r}.")
                     )
 
             self.hook(owner.hook_in, reset)
@@ -311,7 +351,7 @@ class _Installer:
         self.required[(id(owner), rule)].add(key)
         known = self.modules.get((id(module), slot))
         if known is not None and known[0] != role:
-            raise NotImplementedError(
+            raise LRPUnsupportedError(
                 f"{_name(owner)}: one module would need two rules ({known[0]} and {role}); "
                 "use rules without one of them."
             )
@@ -342,7 +382,7 @@ class _Installer:
         if hf_norm is None or isinstance(hf_norm, nn.Identity):
             return
         if not type(hf_norm).__name__.endswith("Norm"):
-            raise NotImplementedError(
+            raise LRPUnsupportedError(
                 f"LN-rule on {_name(norm)}: {type(hf_norm).__name__} is not a known norm "
                 "class. Use rules without 'ln'."
             )
@@ -381,7 +421,10 @@ class _Installer:
 
         def module_hook(_: nn.Module, args: Any, y: torch.Tensor) -> Optional[torch.Tensor]:
             if not args:
-                raise RuntimeError(f"{name}: the HF norm was called with keyword arguments.")
+                raise LRPRuntimeError(
+                    f"{name}: the HF norm was called with keyword arguments, so the LN-rule "
+                    "cannot read its input. Use rules without 'ln'."
+                )
             self.mark(hf_norm)
             if not _needs_grad(args[0]):
                 return None
@@ -412,7 +455,7 @@ class _Installer:
         # hook_out, so cached hook_q/k/v gradients are the scaled ones.
         projections = [attn._modules.get(key) for key in ("q", "k", "v")]
         if any(p is None for p in projections) or len({id(p) for p in projections}) < 3:
-            raise NotImplementedError(
+            raise LRPUnsupportedError(
                 f"{rule!r} on {name}: this attention runs inside HF and has no separate q, k "
                 "and v projections to scale the gradient at (fused QKV, shared K/V, or K/V "
                 f"reused from another layer). Use rules without {rule!r}."
@@ -488,7 +531,10 @@ class _Installer:
 
         def scale_input(_: nn.Module, args: Any) -> Any:
             if len(args) <= index:
-                raise RuntimeError(f"{_name(moe)}: the experts were not called positionally.")
+                raise LRPRuntimeError(
+                    f"{_name(moe)}: the experts were not called positionally, so {rule!r} "
+                    f"cannot reach their input. Use rules without {rule!r}."
+                )
             self.fired.add(key)
             x = args[index]
             return (*args[:index], _Rewire.apply(x.detach(), x, scale), *args[index + 1 :])
@@ -500,7 +546,7 @@ class _Installer:
         act = None if owner is None else _activation(owner)
         if act is None or getattr(act, "inplace", False):
             problem = "no activation module to hook" if act is None else "in-place activation"
-            raise NotImplementedError(
+            raise LRPUnsupportedError(
                 f"{rule!r} on {_name(module)}: {problem}. Use rules without {rule!r}."
             )
         return act
@@ -514,7 +560,7 @@ class _Installer:
             return  # The gate rule holds this activation's input constant.
         act = self.activation(module, "identity")
         if not (isinstance(act, _TORCH_ACTIVATIONS) or type(act).__name__ in _HF_ACTIVATIONS):
-            raise NotImplementedError(
+            raise LRPUnsupportedError(
                 f"Identity-rule on {_name(module)}: {type(act).__name__} is not a known "
                 "elementwise activation with f(0) = 0. Use rules without 'identity'."
             )
@@ -551,7 +597,7 @@ class _Installer:
                 or y.shape != z.shape
                 or loss is not None
             ):
-                raise RuntimeError(
+                raise LRPRuntimeError(
                     f"The 'identity' LRP rule cannot reach the {what} on this call: call the "
                     "bridge (not original_model with labels or return_dict=False) and compute "
                     "any loss from the logits, or use rules without 'identity'."
@@ -616,7 +662,7 @@ class _Installer:
                 remedy: str = remedy,
             ) -> None:
                 if _needs_grad(out):
-                    raise RuntimeError(
+                    raise LRPRuntimeError(
                         f"{label} ran outside every component the LRP rules "
                         f"{sorted(self.sites)} cover, so its gradient (or its gated product's) "
                         f"would be ordinary. {remedy}"
@@ -649,6 +695,70 @@ def _unsupported(model: nn.Module, rules: Collection[LRPRule]) -> list[str]:
     return found
 
 
+def _validated(rules: Optional[Collection[LRPRule]]) -> list[LRPRule]:
+    """The requested rules without duplicates; raises ``LRPConfigError`` for an invalid set."""
+    if isinstance(rules, str):
+        raise LRPConfigError(
+            f"rules must be a collection of rule names, not the string {rules!r}; "
+            f"for a single rule pass [{rules!r}]."
+        )
+    requested: list[LRPRule] = list(dict.fromkeys(DEFAULT_RULES if rules is None else rules))
+    if not requested:
+        raise LRPConfigError(
+            f"rules must be a nonempty subset of {ALL_RULES}; pass None for the default "
+            f"{DEFAULT_RULES}."
+        )
+    unknown = [rule for rule in requested if rule not in ALL_RULES]
+    if unknown:
+        raise LRPConfigError(f"rules must be a nonempty subset of {ALL_RULES}; unknown: {unknown}.")
+    for pair in _EXCLUSIVE:
+        if pair <= set(requested):
+            first, second = (rule for rule in ALL_RULES if rule in pair)
+            raise LRPConfigError(
+                f"{first!r} and {second!r} rewrite the same {_TARGETS[first]}: use rules "
+                f"without both, keeping {first!r} or {second!r}."
+            )
+    return requested
+
+
+# Frames between lrp_rules and its caller: contextlib and runtime type-check wrappers.
+_WRAPPER_MODULES = ("contextlib", "jaxtyping", "beartype", "typeguard")
+
+
+def _internal(frame: Any) -> bool:
+    module = frame.f_globals.get("__name__", "")
+    return module == __name__ or module.split(".")[0] in _WRAPPER_MODULES
+
+
+def _warn(
+    model: TransformerBridge,
+    rules: Optional[Collection[LRPRule]],
+    requested: list[LRPRule],
+    sites: dict[LRPRule, list[str]],
+) -> None:
+    """Warn about rules of a custom set that found nothing, and about float16 under 'ln'."""
+    # Point the warnings at the caller's with statement.
+    frame, stacklevel = sys._getframe(), 1
+    while frame.f_back is not None and _internal(frame):
+        frame, stacklevel = frame.f_back, stacklevel + 1
+    if frozenset(requested) not in _PRESETS:
+        for rule in requested:
+            if not sites[rule]:
+                warnings.warn(
+                    f"The LRP rule {rule!r} found no {_TARGETS[rule]} in this model, so it has "
+                    "no effect.",
+                    LRPWarning,
+                    stacklevel=stacklevel,
+                )
+    if "ln" in requested and any(p.dtype == torch.float16 for p in model.parameters()):
+        warnings.warn(
+            "The LN-rule adds a gradient correction that can overflow in float16 where the "
+            "plain gradient does not; use bfloat16, float32 or float64 for relevance.",
+            LRPWarning,
+            stacklevel=stacklevel,
+        )
+
+
 @contextmanager
 def lrp_rules(
     model: TransformerBridge, rules: Optional[Collection[LRPRule]] = None
@@ -669,28 +779,31 @@ def lrp_rules(
         A mapping from each rule to the components it was installed on.
 
     Raises:
-        ValueError: Empty, unknown or mutually exclusive rules, or a module in training mode.
-        NotImplementedError: A rule meets a component it does not support (the message names
-            the rules to drop).
-        RuntimeError: Nested use, or a forward that needs gradients bypassed a rule.
+        LRPConfigError: Empty, unknown or mutually exclusive rules, a string instead of a
+            collection, or a module in training mode (a ``ValueError``).
+        LRPUnsupportedError: A rule meets a component it does not support; the message names
+            the rules to drop (a ``NotImplementedError``).
+        LRPRuntimeError: Nested use, or a forward that needs gradients bypassed a rule (a
+            ``RuntimeError``).
+
+    Warns:
+        LRPWarning: A rule of a custom rule set (not one of the documented presets) found
+            nothing to act on, or the LN-rule is requested on a float16 model.
     """
-    requested: list[LRPRule] = list(dict.fromkeys(DEFAULT_RULES if rules is None else rules))
-    if (
-        not requested
-        or set(requested) - set(ALL_RULES)
-        or any(pair <= set(requested) for pair in _EXCLUSIVE)
-    ):
-        raise ValueError(
-            f"rules must be a nonempty subset of {ALL_RULES} without both 'ah' and "
-            f"'attn_half' or both 'half' and 'gate', got {rules!r}"
-        )
+    requested = _validated(rules)
     keys = {id(model), id(model.original_model)}
     if keys & _ACTIVE:
-        raise RuntimeError("lrp_rules is already active on this model; nesting would stack rules.")
-    require_eval_mode(model, operation="lrp_rules")
+        raise LRPRuntimeError(
+            "lrp_rules is already active on this model; nesting would stack rules. "
+            "Leave the outer block first."
+        )
+    try:
+        require_eval_mode(model, operation="lrp_rules")
+    except ValueError as error:
+        raise LRPConfigError(str(error)) from error
     unsupported = _unsupported(model, requested)
     if unsupported:
-        raise NotImplementedError(f"LRP rules {requested} cannot cover: {'; '.join(unsupported)}")
+        raise LRPUnsupportedError(f"LRP rules {requested} cannot cover: {'; '.join(unsupported)}")
 
     inst = _Installer(requested)
     _ACTIVE.update(keys)
@@ -711,6 +824,7 @@ def lrp_rules(
             # An extension: RelP and AttnLRP prescribe no rule for the softcap.
             inst.between(model.unembed, model.original_model, "final-logit softcap", output=True)
         inst.uncovered(model)
+        _warn(model, rules, requested, inst.sites)
         yield inst.sites
     finally:
         _ACTIVE.difference_update(keys)

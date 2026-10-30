@@ -86,7 +86,14 @@ from transformer_lens.tools.analysis.jacobian_lens_decomposition import (
     get_sparse_decomposition,
 )
 from transformer_lens.tools.analysis.logit_lens import logit_lens, logit_readout
-from transformer_lens.tools.analysis.lrp import lrp_rules
+from transformer_lens.tools.analysis.lrp import (
+    LRPConfigError,
+    LRPError,
+    LRPRuntimeError,
+    LRPUnsupportedError,
+    LRPWarning,
+    lrp_rules,
+)
 from transformer_lens.tools.analysis.projection_kernel import (
     SubspaceBasis,
     attention_head_subspace_affinity,
@@ -105,6 +112,11 @@ __all__ = [
     "FaithfulnessConfig",
     "JSpaceDecomposition",
     "JacobianLens",
+    "LRPConfigError",
+    "LRPError",
+    "LRPRuntimeError",
+    "LRPUnsupportedError",
+    "LRPWarning",
     "LearnedSubspace",
     "Node",
     "NormMatchedPlacebo",
